@@ -8,6 +8,8 @@ class NetworkMonitor {
     private $colorGreen = "\033[32m";
     private $colorRed = "\033[31m";
     private $colorYellow = "\033[33m";
+    private $colorCyan = "\033[36m";
+    private $colorMagenta = "\033[35m";
     private $clearScreen = "\033[H\033[J";
 
     private $config;
@@ -20,6 +22,9 @@ class NetworkMonitor {
     private $statCacheTime = null;
     private $stateCache = [];
     private $rateHistory = [];
+    private $interfaceDetailsCache = [];
+    private $gatewayCache = null;
+    private $gatewayCacheTime = null;
 
     private const MAX_HISTORY = 5;
     private const MAX_INTERVAL = 3600;
@@ -39,7 +44,9 @@ class NetworkMonitor {
             'show_errors' => true,
             'show_averages' => true,
             'sort_by' => 'rx_rate',
-            'alert_threshold' => 0.01
+            'alert_threshold' => 0.01,
+            'show_details' => false,
+            'show_gateway' => true
         ], $config);
         
         $this->validateConfig();
@@ -101,6 +108,48 @@ class NetworkMonitor {
         return $ifaceName;
     }
 
+    private function getDefaultGateway() {
+        $now = time();
+        if ($this->gatewayCache !== null && $this->gatewayCacheTime !== null && 
+            ($now - $this->gatewayCacheTime) < $this->config['cache_ips_seconds']) {
+            return $this->gatewayCache;
+        }
+
+        $gateway = null;
+        
+        $result = @shell_exec('/sbin/ip route show default 2>/dev/null');
+        if ($result) {
+            foreach (explode("\n", $result) as $line) {
+                if (preg_match('/default via (\S+) dev (\S+)/', $line, $matches)) {
+                    $gateway = [
+                        'ip' => $matches[1],
+                        'interface' => $matches[2]
+                    ];
+                    break;
+                }
+            }
+        }
+
+        if (!$gateway) {
+            $result = @shell_exec('netstat -rn 2>/dev/null');
+            if ($result) {
+                foreach (explode("\n", $result) as $line) {
+                    if (preg_match('/^0\.0\.0\.0\s+(\S+)\s+.*?(\S+)$/', $line, $matches)) {
+                        $gateway = [
+                            'ip' => $matches[1],
+                            'interface' => $matches[2]
+                        ];
+                        break;
+                    }
+                }
+            }
+        }
+
+        $this->gatewayCache = $gateway;
+        $this->gatewayCacheTime = $now;
+        return $gateway;
+    }
+
     private function getInterfaceIPs() {
         $now = time();
         if ($this->ipCache !== null && $this->cacheTime !== null && 
@@ -157,8 +206,29 @@ class NetworkMonitor {
     }
 
     private function isLoopbackInterface($ifaceName, $ifaceData) {
-        return $ifaceName === 'lo' || 
-               (isset($ifaceData['flags']) && in_array('loopback', $ifaceData['flags']));
+        if ($ifaceName === 'lo') {
+            return true;
+        }
+        
+        if (isset($ifaceData['flags']) && in_array('loopback', $ifaceData['flags'])) {
+            return true;
+        }
+        
+        $operstatePath = "/sys/class/net/$ifaceName/operstate";
+        if (file_exists($operstatePath)) {
+            $operstate = trim(file_get_contents($operstatePath));
+            if ($operstate === 'unknown' || $operstate === 'down') {
+                $carrierPath = "/sys/class/net/$ifaceName/carrier";
+                if (file_exists($carrierPath)) {
+                    $carrier = trim(file_get_contents($carrierPath));
+                    if ($carrier === '1') {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
     }
 
     private function isInterfaceInactive($stats) {
@@ -201,13 +271,17 @@ class NetworkMonitor {
     }
 
     private function getInterfaceDetails($ifaceName) {
+        if (isset($this->interfaceDetailsCache[$ifaceName])) {
+            return $this->interfaceDetailsCache[$ifaceName];
+        }
+        
         $details = [];
         
         $speedPath = "/sys/class/net/$ifaceName/speed";
         if (file_exists($speedPath)) {
             $speed = trim(file_get_contents($speedPath));
             if (is_numeric($speed) && $speed > 0) {
-                $details['speed'] = $speed . ' Mbps';
+                $details['speed'] = $speed;
             }
         }
         
@@ -218,8 +292,39 @@ class NetworkMonitor {
                 $details['mtu'] = $mtu;
             }
         }
+
+        $duplexPath = "/sys/class/net/$ifaceName/duplex";
+        if (file_exists($duplexPath)) {
+            $duplex = trim(file_get_contents($duplexPath));
+            if ($duplex) {
+                $details['duplex'] = $duplex;
+            }
+        }
         
+        $this->interfaceDetailsCache[$ifaceName] = $details;
         return $details;
+    }
+
+    private function getInterfaceFlags($ifaceName) {
+        $flags = [];
+        
+        if ($this->isLoopbackInterface($ifaceName, [])) {
+            $flags[] = 'LOOPBACK';
+        }
+        
+        $gateway = $this->getDefaultGateway();
+        if ($gateway && $gateway['interface'] === $ifaceName) {
+            $flags[] = 'GATEWAY';
+        }
+        
+        $state = $this->getInterfaceStateCached($ifaceName);
+        if ($state === 'up') {
+            $flags[] = 'UP';
+        } else {
+            $flags[] = 'DOWN';
+        }
+        
+        return $flags;
     }
 
     private function getCachedStats() {
@@ -331,9 +436,39 @@ class NetworkMonitor {
         return sprintf('%.1f%s', $val, $units[$i]);
     }
 
-    private function header() {
+    private function formatFlags($flags) {
+        $formatted = [];
+        foreach ($flags as $flag) {
+            switch ($flag) {
+                case 'UP':
+                    $formatted[] = $this->colorGreen . $flag . $this->colorReset;
+                    break;
+                case 'DOWN':
+                    $formatted[] = $this->colorRed . $flag . $this->colorReset;
+                    break;
+                case 'LOOPBACK':
+                    $formatted[] = $this->colorMagenta . $flag . $this->colorReset;
+                    break;
+                case 'GATEWAY':
+                    $formatted[] = $this->colorCyan . $flag . $this->colorReset;
+                    break;
+                default:
+                    $formatted[] = $this->colorGrey . $flag . $this->colorReset;
+            }
+        }
+        return '[' . implode(' ', $formatted) . ']';
+    }
+
+    private function header($gatewayInfo = null) {
         echo $this->clearScreen;
-        echo $this->colorBlue . "Network Interface Monitor" . $this->colorReset . "\n";
+        echo $this->colorBlue . "Network Interface Monitor" . $this->colorReset;
+        
+        if ($this->config['show_gateway'] && $gatewayInfo) {
+            echo " | Gateway: " . $this->colorCyan . $gatewayInfo['ip'] . 
+                 $this->colorReset . " via " . $this->colorGreen . $gatewayInfo['interface'] . $this->colorReset;
+        }
+        
+        echo "\n";
         echo $this->colorGrey . "Monitoring interface statistics..." . $this->colorReset . "\n\n";
     }
 
@@ -348,7 +483,7 @@ class NetworkMonitor {
             return;
         }
         
-        declare(ticks=1);
+        pcntl_async_signals(true);
         pcntl_signal(SIGINT, [$this, 'signalHandler']);
         pcntl_signal(SIGTERM, [$this, 'signalHandler']);
     }
@@ -374,6 +509,7 @@ class NetworkMonitor {
             $txDelta = $this->calculateCounterDelta($pr['txBytes'], $now['txBytes']);
 
             $deltas[$name] = [
+                'name' => $name,
                 'rxRate' => $rxDelta / $interval,
                 'txRate' => $txDelta / $interval,
                 'rxBytes' => $now['rxBytes'],
@@ -427,10 +563,13 @@ class NetworkMonitor {
             return ['rx' => 0, 'tx' => 0];
         }
 
-        $rxAvg = array_sum($this->rateHistory[$ifaceName]['rx']) / 
-                 count($this->rateHistory[$ifaceName]['rx']);
-        $txAvg = array_sum($this->rateHistory[$ifaceName]['tx']) / 
-                 count($this->rateHistory[$ifaceName]['tx']);
+        $rxRates = $this->rateHistory[$ifaceName]['rx'];
+        $txRates = $this->rateHistory[$ifaceName]['tx'];
+
+        if (empty($rxRates)) return ['rx' => 0, 'tx' => 0];
+
+        $rxAvg = array_sum($rxRates) / count($rxRates);
+        $txAvg = array_sum($txRates) / count($txRates);
 
         return ['rx' => $rxAvg, 'tx' => $txAvg];
     }
@@ -445,7 +584,7 @@ class NetworkMonitor {
             'active_interfaces' => 0
         ];
 
-        foreach ($deltas as $data) {
+        foreach ($deltas as $name => $data) {
             $metrics['total_rx_rate'] += $data['rxRate'];
             $metrics['total_tx_rate'] += $data['txRate'];
             $metrics['peak_rx_rate'] = max($metrics['peak_rx_rate'], $data['rxRate']);
@@ -455,7 +594,7 @@ class NetworkMonitor {
                 $metrics['active_interfaces']++;
             }
             
-            $this->updateRateHistory($data['name'], $data['rxRate'], $data['txRate']);
+            $this->updateRateHistory($name, $data['rxRate'], $data['txRate']);
         }
 
         return $metrics;
@@ -468,9 +607,9 @@ class NetworkMonitor {
             $totalPackets = $data['rxPackets'] + $data['txPackets'];
             $totalErrors = $data['rxErrs'] + $data['txErrs'];
             
-            if ($totalPackets > 1000 && ($totalErrors / $totalPackets) > $this->config['alert_threshold']) {
-                $issues[] = "High error rate on $name: " . 
-                           round(($totalErrors / $totalPackets) * 100, 2) . "%";
+            if ($totalPackets > 1000 && $totalPackets > 0 && ($totalErrors / $totalPackets) > $this->config['alert_threshold']) {
+                $errorRate = round(($totalErrors / $totalPackets) * 100, 2);
+                $issues[] = "High error rate on $name: {$errorRate}%";
             }
             
             $state = $this->getInterfaceStateCached($name);
@@ -482,35 +621,61 @@ class NetworkMonitor {
         return $issues;
     }
 
+    private function sortDeltas(&$deltas) {
+        switch ($this->config['sort_by']) {
+            case 'tx_rate':
+                uasort($deltas, function($a, $b) {
+                    return $b['txRate'] <=> $a['txRate'];
+                });
+                break;
+            case 'name':
+                ksort($deltas);
+                break;
+            case 'rx_rate':
+            default:
+                uasort($deltas, function($a, $b) {
+                    return $b['rxRate'] <=> $a['rxRate'];
+                });
+                break;
+        }
+    }
+
     private function displayEnhancedDeltas($deltas) {
         $ipMap = $this->getInterfaceIPs();
         $metrics = $this->calculateAdvancedMetrics($deltas);
+        $gateway = $this->getDefaultGateway();
         
-        uasort($deltas, function($a, $b) {
-            return $b['rxRate'] <=> $a['rxRate'];
-        });
+        $this->sortDeltas($deltas);
 
         foreach ($deltas as $name => $data) {
             $ips = $ipMap[$name] ?? [];
             $ipInfo = !empty($ips) ? " [" . implode(', ', $ips) . "]" : "";
             
-            $state = $this->getInterfaceStateCached($name);
-            $stateColor = $state === 'up' ? $this->colorGreen : $this->colorRed;
-            $stateDisplay = $state !== 'unknown' ? " $stateColor$state$this->colorReset" : "";
+            $flags = $this->getInterfaceFlags($name);
+            $flagsDisplay = $this->formatFlags($flags);
             
             $avgRates = $this->getAverageRates($name);
-            $avgInfo = sprintf(" [Avg: %s/%s]", 
-                $this->formatRate($avgRates['rx']),
-                $this->formatRate($avgRates['tx'])
-            );
+            $avgInfo = $this->config['show_averages'] ? 
+                sprintf(" [Avg: %s/%s]", $this->formatRate($avgRates['rx']), $this->formatRate($avgRates['tx'])) : "";
 
-            printf("%s%12s%s%s%s\n",
-                $this->colorBlue, $name, $this->colorReset, $ipInfo, $stateDisplay);
+            $details = $this->getInterfaceDetails($name);
+            $detailsInfo = "";
+            if ($this->config['show_details'] && !empty($details)) {
+                $detailParts = [];
+                if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
+                if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
+                if (isset($details['duplex'])) $detailParts[] = $details['duplex'];
+                if (!empty($detailParts)) {
+                    $detailsInfo = " (" . implode(', ', $detailParts) . ")";
+                }
+            }
+
+            printf("%s%12s%s %s%s%s%s\n",
+                $this->colorBlue, $name, $this->colorReset, $flagsDisplay, $ipInfo, $detailsInfo, $avgInfo);
             
-            printf("  RX: %s%-12s%s TX: %s%-12s%s%s\n",
+            printf("  RX: %s%-12s%s TX: %s%-12s%s\n",
                 $this->colorGreen, $this->formatRate($data['rxRate']), $this->colorReset,
-                $this->colorYellow, $this->formatRate($data['txRate']), $this->colorReset,
-                $this->colorGrey . $avgInfo . $this->colorReset);
+                $this->colorYellow, $this->formatRate($data['txRate']), $this->colorReset);
             
             if ($this->config['show_errors'] && ($data['rxErrs'] > 0 || $data['txErrs'] > 0)) {
                 printf("  %sErrors: RX%.0f TX%.0f Drop: RX%.0f TX%.0f%s\n",
@@ -521,20 +686,26 @@ class NetworkMonitor {
             echo "\n";
         }
         
-        $this->displaySummary($metrics, count($deltas));
+        $this->displaySummary($metrics, count($deltas), $gateway);
     }
 
-    private function displaySummary($metrics, $interfaceCount) {
+    private function displaySummary($metrics, $interfaceCount, $gateway) {
         echo $this->colorGrey . str_repeat("─", 60) . $this->colorReset . "\n";
         printf("Summary: %d interfaces (%d active) | Total: %s/s RX, %s/s TX\n",
             $interfaceCount, $metrics['active_interfaces'],
             $this->formatRate($metrics['total_rx_rate']),
             $this->formatRate($metrics['total_tx_rate']));
         
-        printf("Peak: %s/s RX, %s/s TX | %s\n",
+        printf("Peak: %s/s RX, %s/s TX",
             $this->formatRate($metrics['peak_rx_rate']),
-            $this->formatRate($metrics['peak_tx_rate']),
-            date('H:i:s'));
+            $this->formatRate($metrics['peak_tx_rate']));
+        
+        if ($this->config['show_gateway'] && $gateway) {
+            printf(" | Gateway: %s%s%s",
+                $this->colorCyan, $gateway['ip'], $this->colorReset);
+        }
+        
+        printf(" | %s\n", date('H:i:s'));
         
         echo $this->colorGrey . "[ctrl+c to stop]" . $this->colorReset . "\n";
     }
@@ -554,7 +725,7 @@ class NetworkMonitor {
         if ($sleepTime > 1000) {
             $load = $this->getSystemLoad();
             if ($load > 2.0) {
-                $sleepTime *= 0.5;
+                $sleepTime = max(1000, $sleepTime * 0.5);
             }
             usleep((int)$sleepTime);
         }
@@ -569,7 +740,7 @@ class NetworkMonitor {
             
             $progress = str_repeat('█', $i + 1) . str_repeat('░', $sleepSteps - $i - 1);
             echo "\r" . $this->colorGrey . "[" . $progress . "] " . 
-                 ($i + 1) * (100 / $sleepSteps) . "%" . $this->colorReset;
+                 round(($i + 1) * (100 / $sleepSteps)) . "%" . $this->colorReset;
             usleep((int)$stepDuration);
         }
         echo "\r" . str_repeat(' ', 50) . "\r";
@@ -581,6 +752,7 @@ class NetworkMonitor {
         $this->setupSignalHandlers();
         $iteration = 0;
         $startTime = time();
+        $gateway = $this->getDefaultGateway();
 
         try {
             $prev = $this->parseProcNetDev();
@@ -593,7 +765,7 @@ class NetworkMonitor {
             $currentTime = time();
             $uptime = $currentTime - $startTime;
             
-            $this->header();
+            $this->header($gateway);
             printf("Uptime: %ds | Iteration: %d | %s\n\n", 
                    $uptime, $iteration, date('Y-m-d H:i:s'));
 
@@ -628,7 +800,9 @@ class NetworkMonitor {
     private function singleShotMode() {
         $this->log("Running in single shot mode");
         
-        $this->header();
+        $gateway = $this->getDefaultGateway();
+        $this->header($gateway);
+        
         try {
             $stats = $this->parseProcNetDev();
         } catch (Exception $e) {
@@ -653,17 +827,20 @@ class NetworkMonitor {
                 $ipInfo = " - " . $this->colorGrey . implode(', ', $ips) . $this->colorReset;
             }
             
-            $state = $this->getInterfaceStateCached($s['name']);
-            $stateColor = $state === 'up' ? $this->colorGreen : $this->colorRed;
-            $stateDisplay = $state !== 'unknown' ? " [$stateColor$state$this->colorReset]" : "";
+            $flags = $this->getInterfaceFlags($s['name']);
+            $flagsDisplay = $this->formatFlags($flags);
             
             $details = $this->getInterfaceDetails($s['name']);
             $detailsInfo = "";
             if (!empty($details)) {
-                $detailsInfo = " (" . implode(', ', $details) . ")";
+                $detailParts = [];
+                if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
+                if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
+                if (isset($details['duplex'])) $detailParts[] = $details['duplex'];
+                $detailsInfo = " (" . implode(', ', $detailParts) . ")";
             }
             
-            echo $this->colorBlue . $s['name'] . $this->colorReset . $stateDisplay . $detailsInfo . $ipInfo . "\n";
+            echo $this->colorBlue . $s['name'] . $this->colorReset . " " . $flagsDisplay . $detailsInfo . $ipInfo . "\n";
             printf("    RX: %s%s%s (%.0f pkts, %.0f errs, %.0f drop)\n",
                 $this->colorGreen, $this->formatBytes($s['rxBytes']), $this->colorReset,
                 $s['rxPackets'], $s['rxErrs'], $s['rxDrop']);
@@ -676,6 +853,11 @@ class NetworkMonitor {
         
         if ($displayed === 0) {
             echo $this->colorGrey . "No active interfaces found." . $this->colorReset . "\n";
+        }
+        
+        if ($this->config['show_gateway'] && $gateway) {
+            printf("%sDefault Gateway: %s via %s%s\n",
+                $this->colorCyan, $gateway['ip'], $gateway['interface'], $this->colorReset);
         }
         
         echo $this->colorGrey . "Invoke with --watch for live view." . $this->colorReset . "\n";
@@ -697,7 +879,7 @@ class NetworkMonitor {
 
     public function run() {
         try {
-            $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:']);
+            $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:', 'show-details', 'show-gateway']);
             
             $this->handleOptions($options);
             
@@ -711,6 +893,14 @@ class NetworkMonitor {
 
             if (isset($options['sort-by']) && in_array($options['sort-by'], ['rx_rate', 'tx_rate', 'name'])) {
                 $this->config['sort_by'] = $options['sort-by'];
+            }
+
+            if (isset($options['show-details'])) {
+                $this->config['show_details'] = true;
+            }
+
+            if (isset($options['show-gateway'])) {
+                $this->config['show_gateway'] = true;
             }
 
             $this->validateConfig();
