@@ -31,6 +31,9 @@ class NetworkMonitor {
     private const MIN_INTERVAL = 0.1;
     private const MAX_INTERFACES = 1000;
     private const DEFAULT_CACHE_TTL = 5;
+    private const MAX_FILE_SIZE = 8192;
+    private const MAX_RETRIES = 3;
+    private const RETRY_DELAY = 100000;
 
     public function __construct(array $config = []) {
         $this->config = array_merge([
@@ -50,19 +53,29 @@ class NetworkMonitor {
         ], $config);
         
         $this->validateConfig();
+        $this->enforceResourceLimits();
     }
 
     private function validateConfig() {
-        if ($this->config['interval'] < self::MIN_INTERVAL || $this->config['interval'] > self::MAX_INTERVAL) {
-            throw new InvalidArgumentException(
-                "Interval must be between " . self::MIN_INTERVAL . " and " . self::MAX_INTERVAL
-            );
-        }
+        $validators = [
+            'interval' => fn($v) => $v >= self::MIN_INTERVAL && $v <= self::MAX_INTERVAL,
+            'max_interfaces' => fn($v) => $v > 0 && $v <= self::MAX_INTERFACES,
+            'units' => fn($v) => in_array($v, ['binary', 'decimal']),
+            'sort_by' => fn($v) => in_array($v, ['rx_rate', 'tx_rate', 'name'])
+        ];
         
-        if ($this->config['max_interfaces'] > self::MAX_INTERFACES) {
-            throw new InvalidArgumentException(
-                "Max interfaces cannot exceed " . self::MAX_INTERFACES
-            );
+        foreach ($validators as $key => $validator) {
+            if (isset($this->config[$key]) && !$validator($this->config[$key])) {
+                throw new InvalidArgumentException("Invalid value for configuration '$key': " . $this->config[$key]);
+            }
+        }
+    }
+
+    private function enforceResourceLimits() {
+        ini_set('memory_limit', '64M');
+        
+        if (function_exists('setrlimit') && defined('RLIMIT_NOFILE')) {
+            setrlimit(RLIMIT_NOFILE, 1024, 1024);
         }
     }
 
@@ -75,12 +88,23 @@ class NetworkMonitor {
             throw new RuntimeException("File is not readable: $path");
         }
         
-        $content = file_get_contents($path);
+        $content = @file_get_contents($path, false, null, 0, self::MAX_FILE_SIZE);
         if ($content === false) {
             throw new RuntimeException("Failed to read file: $path");
         }
         
         return $content;
+    }
+
+    private function safeShellExec($command) {
+        $escapedCommand = escapeshellcmd($command);
+        return @shell_exec($escapedCommand);
+    }
+
+    private function validateAndBuildPath($ifaceName, $filename) {
+        $this->validateInterfaceName($ifaceName);
+        $safeFilename = basename($filename);
+        return "/sys/class/net/" . $ifaceName . "/" . $safeFilename;
     }
 
     private function log($message, $level = 'INFO') {
@@ -117,7 +141,7 @@ class NetworkMonitor {
 
         $gateway = null;
         
-        $result = @shell_exec('/sbin/ip route show default 2>/dev/null');
+        $result = $this->safeShellExec('/sbin/ip route show default');
         if ($result) {
             foreach (explode("\n", $result) as $line) {
                 if (preg_match('/default via (\S+) dev (\S+)/', $line, $matches)) {
@@ -131,7 +155,7 @@ class NetworkMonitor {
         }
 
         if (!$gateway) {
-            $result = @shell_exec('netstat -rn 2>/dev/null');
+            $result = $this->safeShellExec('netstat -rn');
             if ($result) {
                 foreach (explode("\n", $result) as $line) {
                     if (preg_match('/^0\.0\.0\.0\s+(\S+)\s+.*?(\S+)$/', $line, $matches)) {
@@ -158,7 +182,7 @@ class NetworkMonitor {
         }
 
         $ips = [];
-        $result = @shell_exec('/sbin/ip -o -4 addr show 2>/dev/null');
+        $result = $this->safeShellExec('/sbin/ip -o -4 addr show');
         if ($result) {
             foreach (explode("\n", $result) as $line) {
                 if (preg_match('/^\d+:\s+(\S+)\s+inet\s+(\S+)/', $line, $matches)) {
@@ -214,13 +238,13 @@ class NetworkMonitor {
             return true;
         }
         
-        $operstatePath = "/sys/class/net/$ifaceName/operstate";
+        $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
         if (file_exists($operstatePath)) {
-            $operstate = trim(file_get_contents($operstatePath));
+            $operstate = trim($this->safeFileRead($operstatePath));
             if ($operstate === 'unknown' || $operstate === 'down') {
-                $carrierPath = "/sys/class/net/$ifaceName/carrier";
+                $carrierPath = $this->validateAndBuildPath($ifaceName, 'carrier');
                 if (file_exists($carrierPath)) {
-                    $carrier = trim(file_get_contents($carrierPath));
+                    $carrier = trim($this->safeFileRead($carrierPath));
                     if ($carrier === '1') {
                         return true;
                     }
@@ -247,7 +271,7 @@ class NetworkMonitor {
     }
 
     private function getInterfaceState($ifaceName) {
-        $operstatePath = "/sys/class/net/$ifaceName/operstate";
+        $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
         try {
             return trim($this->safeFileRead($operstatePath));
         } catch (Exception $e) {
@@ -277,25 +301,25 @@ class NetworkMonitor {
         
         $details = [];
         
-        $speedPath = "/sys/class/net/$ifaceName/speed";
+        $speedPath = $this->validateAndBuildPath($ifaceName, 'speed');
         if (file_exists($speedPath)) {
-            $speed = trim(file_get_contents($speedPath));
+            $speed = trim($this->safeFileRead($speedPath));
             if (is_numeric($speed) && $speed > 0) {
                 $details['speed'] = $speed;
             }
         }
         
-        $mtuPath = "/sys/class/net/$ifaceName/mtu";
+        $mtuPath = $this->validateAndBuildPath($ifaceName, 'mtu');
         if (file_exists($mtuPath)) {
-            $mtu = trim(file_get_contents($mtuPath));
+            $mtu = trim($this->safeFileRead($mtuPath));
             if (is_numeric($mtu)) {
                 $details['mtu'] = $mtu;
             }
         }
 
-        $duplexPath = "/sys/class/net/$ifaceName/duplex";
+        $duplexPath = $this->validateAndBuildPath($ifaceName, 'duplex');
         if (file_exists($duplexPath)) {
-            $duplex = trim(file_get_contents($duplexPath));
+            $duplex = trim($this->safeFileRead($duplexPath));
             if ($duplex) {
                 $details['duplex'] = $duplex;
             }
@@ -327,6 +351,23 @@ class NetworkMonitor {
         return $flags;
     }
 
+    private function cleanupCaches() {
+        $now = time();
+        $maxCacheAge = 300;
+        
+        if ($this->statCacheTime && ($now - $this->statCacheTime) > $maxCacheAge) {
+            $this->statCache = null;
+            $this->statCacheTime = null;
+        }
+        
+        foreach ($this->rateHistory as $iface => &$history) {
+            if (count($history['rx']) > 60) {
+                $history['rx'] = array_slice($history['rx'], -60);
+                $history['tx'] = array_slice($history['tx'], -60);
+            }
+        }
+    }
+
     private function getCachedStats() {
         $now = time();
         $cacheTtl = $this->config['cache_stats_seconds'];
@@ -342,6 +383,21 @@ class NetworkMonitor {
     }
 
     private function parseProcNetDev() {
+        for ($attempt = 1; $attempt <= self::MAX_RETRIES; $attempt++) {
+            try {
+                return $this->doParseProcNetDev();
+            } catch (Exception $e) {
+                if ($attempt === self::MAX_RETRIES) {
+                    throw new RuntimeException("Failed to parse /proc/net/dev after " . self::MAX_RETRIES . " attempts: " . $e->getMessage());
+                }
+                usleep(self::RETRY_DELAY);
+            }
+        }
+        
+        throw new RuntimeException("Unexpected error in parseProcNetDev");
+    }
+
+    private function doParseProcNetDev() {
         $stats = [];
         
         if (!file_exists('/proc/net/dev')) {
@@ -436,6 +492,33 @@ class NetworkMonitor {
         return sprintf('%.1f%s', $val, $units[$i]);
     }
 
+    private function convertUnits($bytes, $from = 'bytes', $to = 'auto') {
+        $units = [
+            'bytes' => 1,
+            'kilobits' => 125,
+            'megabits' => 125000,
+            'kilobytes' => 1000,
+            'megabytes' => 1000000,
+        ];
+        
+        if ($to === 'auto') {
+            $abs = abs($bytes);
+            if ($abs >= $units['megabytes']) {
+                return [$bytes / $units['megabytes'], 'MB'];
+            } elseif ($abs >= $units['kilobytes']) {
+                return [$bytes / $units['kilobytes'], 'KB'];
+            } else {
+                return [$bytes, 'B'];
+            }
+        }
+        
+        if (isset($units[$from]) && isset($units[$to])) {
+            return $bytes * ($units[$to] / $units[$from]);
+        }
+        
+        throw new InvalidArgumentException("Invalid units: $from or $to");
+    }
+
     private function formatFlags($flags) {
         $formatted = [];
         foreach ($flags as $flag) {
@@ -483,9 +566,19 @@ class NetworkMonitor {
             return;
         }
         
-        pcntl_async_signals(true);
-        pcntl_signal(SIGINT, [$this, 'signalHandler']);
-        pcntl_signal(SIGTERM, [$this, 'signalHandler']);
+        if (!function_exists('pcntl_async_signals')) {
+            $this->log('pcntl_async_signals not available, using legacy signal handling');
+            declare(ticks=1);
+        } else {
+            pcntl_async_signals(true);
+        }
+        
+        $signals = [SIGINT, SIGTERM, SIGHUP];
+        foreach ($signals as $signal) {
+            if (!pcntl_signal($signal, [$this, 'signalHandler'])) {
+                $this->log("Failed to set handler for signal $signal");
+            }
+        }
     }
 
     private function manageHistory($current) {
@@ -527,17 +620,12 @@ class NetworkMonitor {
     }
 
     private function calculateCounterDelta($prev, $curr) {
-        $max32 = 4294967295;
-        $max64 = 18446744073709551615;
+        $maxValue = PHP_INT_MAX;
         
         if ($curr >= $prev) {
             return $curr - $prev;
         } else {
-            if ($prev > $max32) {
-                return ($max64 - $prev) + $curr + 1;
-            } else {
-                return ($max32 - $prev) + $curr + 1;
-            }
+            return ($maxValue - $prev) + $curr;
         }
     }
 
@@ -712,7 +800,7 @@ class NetworkMonitor {
 
     private function getSystemLoad() {
         if (file_exists('/proc/loadavg')) {
-            $load = file_get_contents('/proc/loadavg');
+            $load = $this->safeFileRead('/proc/loadavg');
             return floatval(explode(' ', $load)[0]);
         }
         return 0.0;
@@ -770,6 +858,7 @@ class NetworkMonitor {
                    $uptime, $iteration, date('Y-m-d H:i:s'));
 
             try {
+                $this->cleanupCaches();
                 $curr = $this->getCachedStats();
                 $deltas = $this->calculateDelta($prev, $curr, $interval);
                 
@@ -906,6 +995,7 @@ class NetworkMonitor {
             $this->validateConfig();
 
             if (isset($options['watch'])) {
+                set_time_limit(0);
                 $this->watch($this->config['interval']);
             } else {
                 $this->singleShotMode();
@@ -929,9 +1019,11 @@ class NetworkMonitor {
 }
 
 try {
+    error_reporting(E_ALL);
     $monitor = new NetworkMonitor();
     $monitor->run();
-} catch (Exception $e) {
+} catch (Throwable $e) {
+    error_log("Fatal error: " . $e->getMessage());
     echo "Fatal Error: " . $e->getMessage() . "\n";
     exit(1);
 }
