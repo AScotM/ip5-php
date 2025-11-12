@@ -1,6 +1,30 @@
 #!/usr/bin/php
 <?php
 
+class NetworkMonitorConfig {
+    public $interval = 1.0;
+    public $show_loopback = false;
+    public $show_inactive = false;
+    public $max_interfaces = 50;
+    public $units = 'binary';
+    public $cache_ips_seconds = 5;
+    public $cache_stats_seconds = 1;
+    public $show_errors = true;
+    public $show_averages = true;
+    public $sort_by = 'rx_rate';
+    public $alert_threshold = 0.01;
+    public $show_details = false;
+    public $show_gateway = true;
+    
+    public function __construct(array $options = []) {
+        foreach ($options as $key => $value) {
+            if (property_exists($this, $key)) {
+                $this->$key = $value;
+            }
+        }
+    }
+}
+
 class NetworkMonitor {
     private $colorReset = "\033[0m";
     private $colorGrey = "\033[38;5;245m";
@@ -36,22 +60,7 @@ class NetworkMonitor {
     private const RETRY_DELAY = 100000;
 
     public function __construct(array $config = []) {
-        $this->config = array_merge([
-            'interval' => 1.0,
-            'show_loopback' => false,
-            'show_inactive' => false,
-            'max_interfaces' => 50,
-            'units' => 'binary',
-            'cache_ips_seconds' => 5,
-            'cache_stats_seconds' => 1,
-            'show_errors' => true,
-            'show_averages' => true,
-            'sort_by' => 'rx_rate',
-            'alert_threshold' => 0.01,
-            'show_details' => false,
-            'show_gateway' => true
-        ], $config);
-        
+        $this->config = new NetworkMonitorConfig($config);
         $this->validateConfig();
         $this->enforceResourceLimits();
     }
@@ -61,18 +70,26 @@ class NetworkMonitor {
             'interval' => fn($v) => $v >= self::MIN_INTERVAL && $v <= self::MAX_INTERVAL,
             'max_interfaces' => fn($v) => $v > 0 && $v <= self::MAX_INTERFACES,
             'units' => fn($v) => in_array($v, ['binary', 'decimal']),
-            'sort_by' => fn($v) => in_array($v, ['rx_rate', 'tx_rate', 'name'])
+            'sort_by' => fn($v) => in_array($v, ['rx_rate', 'tx_rate', 'name']),
+            'alert_threshold' => fn($v) => $v >= 0 && $v <= 1,
+            'cache_ips_seconds' => fn($v) => $v > 0 && $v <= 300,
+            'cache_stats_seconds' => fn($v) => $v > 0 && $v <= 60
         ];
         
         foreach ($validators as $key => $validator) {
-            if (isset($this->config[$key]) && !$validator($this->config[$key])) {
-                throw new InvalidArgumentException("Invalid value for configuration '$key': " . $this->config[$key]);
+            $value = $this->config->$key;
+            if (!$validator($value)) {
+                throw new InvalidArgumentException("Invalid value for configuration '$key': $value");
             }
         }
     }
 
     private function enforceResourceLimits() {
         ini_set('memory_limit', '64M');
+        
+        if (function_exists('set_time_limit')) {
+            set_time_limit(0);
+        }
         
         if (function_exists('setrlimit') && defined('RLIMIT_NOFILE')) {
             setrlimit(RLIMIT_NOFILE, 1024, 1024);
@@ -88,6 +105,15 @@ class NetworkMonitor {
             throw new RuntimeException("File is not readable: $path");
         }
         
+        if (is_dir($path)) {
+            throw new RuntimeException("Path is a directory: $path");
+        }
+        
+        $size = filesize($path);
+        if ($size > self::MAX_FILE_SIZE) {
+            throw new RuntimeException("File too large: $path");
+        }
+        
         $content = @file_get_contents($path, false, null, 0, self::MAX_FILE_SIZE);
         if ($content === false) {
             throw new RuntimeException("Failed to read file: $path");
@@ -97,6 +123,24 @@ class NetworkMonitor {
     }
 
     private function safeShellExec($command) {
+        $allowedCommands = [
+            '/sbin/ip -o -4 addr show',
+            '/sbin/ip route show default',
+            'netstat -rn'
+        ];
+        
+        $isAllowed = false;
+        foreach ($allowedCommands as $allowed) {
+            if (strpos($command, $allowed) === 0) {
+                $isAllowed = true;
+                break;
+            }
+        }
+        
+        if (!$isAllowed) {
+            throw new InvalidArgumentException("Command not allowed: $command");
+        }
+        
         $escapedCommand = escapeshellcmd($command);
         return @shell_exec($escapedCommand);
     }
@@ -104,7 +148,37 @@ class NetworkMonitor {
     private function validateAndBuildPath($ifaceName, $filename) {
         $this->validateInterfaceName($ifaceName);
         $safeFilename = basename($filename);
-        return "/sys/class/net/" . $ifaceName . "/" . $safeFilename;
+        $path = "/sys/class/net/" . $ifaceName . "/" . $safeFilename;
+        
+        return $path;
+    }
+
+    private function validateSysfsPath($path) {
+        $normalizedPath = str_replace('//', '/', $path);
+        
+        if (strpos($normalizedPath, '/sys/class/net/') !== 0) {
+            return false;
+        }
+        
+        $pathParts = explode('/', $normalizedPath);
+        if (count($pathParts) < 5) {
+            return false;
+        }
+        
+        $ifaceName = $pathParts[4];
+        if (!$this->validateInterfaceName($ifaceName)) {
+            return false;
+        }
+        
+        if (count($pathParts) > 5) {
+            $filename = $pathParts[5];
+            $allowedFiles = ['operstate', 'carrier', 'speed', 'mtu', 'duplex'];
+            if (!in_array($filename, $allowedFiles)) {
+                return false;
+            }
+        }
+        
+        return true;
     }
 
     private function log($message, $level = 'INFO') {
@@ -126,7 +200,7 @@ class NetworkMonitor {
     }
 
     private function validateInterfaceName($ifaceName) {
-        if (!preg_match('/^[a-zA-Z0-9:_\.-]+$/', $ifaceName)) {
+        if (!preg_match('/^[a-zA-Z0-9:_\.-]{1,15}$/', $ifaceName)) {
             throw new InvalidArgumentException("Invalid interface name: $ifaceName");
         }
         return $ifaceName;
@@ -135,30 +209,17 @@ class NetworkMonitor {
     private function getDefaultGateway() {
         $now = time();
         if ($this->gatewayCache !== null && $this->gatewayCacheTime !== null && 
-            ($now - $this->gatewayCacheTime) < $this->config['cache_ips_seconds']) {
+            ($now - $this->gatewayCacheTime) < $this->config->cache_ips_seconds) {
             return $this->gatewayCache;
         }
 
         $gateway = null;
         
-        $result = $this->safeShellExec('/sbin/ip route show default');
-        if ($result) {
-            foreach (explode("\n", $result) as $line) {
-                if (preg_match('/default via (\S+) dev (\S+)/', $line, $matches)) {
-                    $gateway = [
-                        'ip' => $matches[1],
-                        'interface' => $matches[2]
-                    ];
-                    break;
-                }
-            }
-        }
-
-        if (!$gateway) {
-            $result = $this->safeShellExec('netstat -rn');
+        try {
+            $result = $this->safeShellExec('/sbin/ip route show default');
             if ($result) {
                 foreach (explode("\n", $result) as $line) {
-                    if (preg_match('/^0\.0\.0\.0\s+(\S+)\s+.*?(\S+)$/', $line, $matches)) {
+                    if (preg_match('/default via (\S+) dev (\S+)/', $line, $matches)) {
                         $gateway = [
                             'ip' => $matches[1],
                             'interface' => $matches[2]
@@ -166,6 +227,27 @@ class NetworkMonitor {
                         break;
                     }
                 }
+            }
+        } catch (Exception $e) {
+            $this->log("Failed to get gateway via ip command: " . $e->getMessage());
+        }
+
+        if (!$gateway) {
+            try {
+                $result = $this->safeShellExec('netstat -rn');
+                if ($result) {
+                    foreach (explode("\n", $result) as $line) {
+                        if (preg_match('/^0\.0\.0\.0\s+(\S+)\s+.*?(\S+)$/', $line, $matches)) {
+                            $gateway = [
+                                'ip' => $matches[1],
+                                'interface' => $matches[2]
+                            ];
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception $e) {
+                $this->log("Failed to get gateway via netstat: " . $e->getMessage());
             }
         }
 
@@ -177,29 +259,38 @@ class NetworkMonitor {
     private function getInterfaceIPs() {
         $now = time();
         if ($this->ipCache !== null && $this->cacheTime !== null && 
-            ($now - $this->cacheTime) < $this->config['cache_ips_seconds']) {
+            ($now - $this->cacheTime) < $this->config->cache_ips_seconds) {
             return $this->ipCache;
         }
 
         $ips = [];
-        $result = $this->safeShellExec('/sbin/ip -o -4 addr show');
-        if ($result) {
-            foreach (explode("\n", $result) as $line) {
-                if (preg_match('/^\d+:\s+(\S+)\s+inet\s+(\S+)/', $line, $matches)) {
-                    $iface = $matches[1];
-                    $ip = $matches[2];
-                    $ips[$iface][] = explode('/', $ip)[0];
+        
+        try {
+            $result = $this->safeShellExec('/sbin/ip -o -4 addr show');
+            if ($result) {
+                foreach (explode("\n", $result) as $line) {
+                    if (preg_match('/^\d+:\s+(\S+)\s+inet\s+(\S+)/', $line, $matches)) {
+                        $iface = $this->validateInterfaceName($matches[1]);
+                        $ip = $matches[2];
+                        $ips[$iface][] = explode('/', $ip)[0];
+                    }
                 }
             }
-        } else {
+        } catch (Exception $e) {
+            $this->log("Failed to get IPs via ip command: " . $e->getMessage());
+        }
+
+        if (empty($ips)) {
             $interfaces = @net_get_interfaces();
             if (!$interfaces) {
-                $this->log('Failed to get network interfaces');
+                $this->log('Failed to get network interfaces via net_get_interfaces');
                 return $ips;
             }
 
             foreach ($interfaces as $ifaceName => $ifaceData) {
-                if (!$this->config['show_loopback'] && $this->isLoopbackInterface($ifaceName, $ifaceData)) {
+                $ifaceName = $this->validateInterfaceName($ifaceName);
+                
+                if (!$this->config->show_loopback && $this->isLoopbackInterface($ifaceName, $ifaceData)) {
                     continue;
                 }
 
@@ -238,18 +329,22 @@ class NetworkMonitor {
             return true;
         }
         
-        $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
-        if (file_exists($operstatePath)) {
-            $operstate = trim($this->safeFileRead($operstatePath));
-            if ($operstate === 'unknown' || $operstate === 'down') {
-                $carrierPath = $this->validateAndBuildPath($ifaceName, 'carrier');
-                if (file_exists($carrierPath)) {
-                    $carrier = trim($this->safeFileRead($carrierPath));
-                    if ($carrier === '1') {
-                        return true;
+        try {
+            $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
+            if (file_exists($operstatePath) && $this->validateSysfsPath($operstatePath)) {
+                $operstate = trim($this->safeFileRead($operstatePath));
+                if ($operstate === 'unknown' || $operstate === 'down') {
+                    $carrierPath = $this->validateAndBuildPath($ifaceName, 'carrier');
+                    if (file_exists($carrierPath) && $this->validateSysfsPath($carrierPath)) {
+                        $carrier = trim($this->safeFileRead($carrierPath));
+                        if ($carrier === '1') {
+                            return true;
+                        }
                     }
                 }
             }
+        } catch (Exception $e) {
+            $this->log("Failed to check loopback status for $ifaceName: " . $e->getMessage());
         }
         
         return false;
@@ -261,10 +356,10 @@ class NetworkMonitor {
     }
 
     private function shouldShowInterface($ifaceName, $stats) {
-        if (!$this->config['show_loopback'] && $this->isLoopbackInterface($ifaceName, [])) {
+        if (!$this->config->show_loopback && $this->isLoopbackInterface($ifaceName, [])) {
             return false;
         }
-        if (!$this->config['show_inactive'] && $this->isInterfaceInactive($stats)) {
+        if (!$this->config->show_inactive && $this->isInterfaceInactive($stats)) {
             return false;
         }
         return true;
@@ -273,6 +368,9 @@ class NetworkMonitor {
     private function getInterfaceState($ifaceName) {
         $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
         try {
+            if (!$this->validateSysfsPath($operstatePath)) {
+                return 'unknown';
+            }
             return trim($this->safeFileRead($operstatePath));
         } catch (Exception $e) {
             return 'unknown';
@@ -301,30 +399,30 @@ class NetworkMonitor {
         
         $details = [];
         
-        $speedPath = $this->validateAndBuildPath($ifaceName, 'speed');
-        if (file_exists($speedPath)) {
-            $speed = trim($this->safeFileRead($speedPath));
-            if (is_numeric($speed) && $speed > 0) {
-                $details['speed'] = $speed;
-            }
-        }
+        $filesToCheck = [
+            'speed' => 'speed',
+            'mtu' => 'mtu',
+            'duplex' => 'duplex'
+        ];
         
-        $mtuPath = $this->validateAndBuildPath($ifaceName, 'mtu');
-        if (file_exists($mtuPath)) {
-            $mtu = trim($this->safeFileRead($mtuPath));
-            if (is_numeric($mtu)) {
-                $details['mtu'] = $mtu;
+        foreach ($filesToCheck as $key => $filename) {
+            try {
+                $path = $this->validateAndBuildPath($ifaceName, $filename);
+                if (file_exists($path) && $this->validateSysfsPath($path)) {
+                    $value = trim($this->safeFileRead($path));
+                    if ($key === 'speed' && is_numeric($value) && $value > 0) {
+                        $details[$key] = (int)$value;
+                    } elseif ($key === 'mtu' && is_numeric($value)) {
+                        $details[$key] = (int)$value;
+                    } elseif ($key === 'duplex' && !empty($value)) {
+                        $details[$key] = $value;
+                    }
+                }
+            } catch (Exception $e) {
+                $this->log("Failed to read $key for $ifaceName: " . $e->getMessage());
             }
         }
 
-        $duplexPath = $this->validateAndBuildPath($ifaceName, 'duplex');
-        if (file_exists($duplexPath)) {
-            $duplex = trim($this->safeFileRead($duplexPath));
-            if ($duplex) {
-                $details['duplex'] = $duplex;
-            }
-        }
-        
         $this->interfaceDetailsCache[$ifaceName] = $details;
         return $details;
     }
@@ -366,11 +464,15 @@ class NetworkMonitor {
                 $history['tx'] = array_slice($history['tx'], -60);
             }
         }
+        
+        if (count($this->interfaceDetailsCache) > 100) {
+            $this->interfaceDetailsCache = array_slice($this->interfaceDetailsCache, -50, null, true);
+        }
     }
 
     private function getCachedStats() {
         $now = time();
-        $cacheTtl = $this->config['cache_stats_seconds'];
+        $cacheTtl = $this->config->cache_stats_seconds;
         
         if ($this->statCache !== null && 
             ($now - $this->statCacheTime) < $cacheTtl) {
@@ -414,7 +516,7 @@ class NetworkMonitor {
 
         $interfaceCount = 0;
 
-        while (($line = fgets($handle)) !== false && $interfaceCount < $this->config['max_interfaces']) {
+        while (($line = fgets($handle)) !== false && $interfaceCount < $this->config->max_interfaces) {
             $line = trim($line);
             if (empty($line)) continue;
 
@@ -453,7 +555,7 @@ class NetworkMonitor {
     }
 
     private function formatBytes($bytes) {
-        if ($this->config['units'] === 'decimal') {
+        if ($this->config->units === 'decimal') {
             $units = ['B', 'KB', 'MB', 'GB', 'TB'];
             $divisor = 1000;
         } else {
@@ -473,7 +575,7 @@ class NetworkMonitor {
     }
 
     private function formatRate($rate) {
-        if ($this->config['units'] === 'decimal') {
+        if ($this->config->units === 'decimal') {
             $units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
             $divisor = 1000;
         } else {
@@ -490,33 +592,6 @@ class NetworkMonitor {
         }
         
         return sprintf('%.1f%s', $val, $units[$i]);
-    }
-
-    private function convertUnits($bytes, $from = 'bytes', $to = 'auto') {
-        $units = [
-            'bytes' => 1,
-            'kilobits' => 125,
-            'megabits' => 125000,
-            'kilobytes' => 1000,
-            'megabytes' => 1000000,
-        ];
-        
-        if ($to === 'auto') {
-            $abs = abs($bytes);
-            if ($abs >= $units['megabytes']) {
-                return [$bytes / $units['megabytes'], 'MB'];
-            } elseif ($abs >= $units['kilobytes']) {
-                return [$bytes / $units['kilobytes'], 'KB'];
-            } else {
-                return [$bytes, 'B'];
-            }
-        }
-        
-        if (isset($units[$from]) && isset($units[$to])) {
-            return $bytes * ($units[$to] / $units[$from]);
-        }
-        
-        throw new InvalidArgumentException("Invalid units: $from or $to");
     }
 
     private function formatFlags($flags) {
@@ -546,7 +621,7 @@ class NetworkMonitor {
         echo $this->clearScreen;
         echo $this->colorBlue . "Network Interface Monitor" . $this->colorReset;
         
-        if ($this->config['show_gateway'] && $gatewayInfo) {
+        if ($this->config->show_gateway && $gatewayInfo) {
             echo " | Gateway: " . $this->colorCyan . $gatewayInfo['ip'] . 
                  $this->colorReset . " via " . $this->colorGreen . $gatewayInfo['interface'] . $this->colorReset;
         }
@@ -566,11 +641,10 @@ class NetworkMonitor {
             return;
         }
         
-        if (!function_exists('pcntl_async_signals')) {
-            $this->log('pcntl_async_signals not available, using legacy signal handling');
-            declare(ticks=1);
-        } else {
+        if (function_exists('pcntl_async_signals')) {
             pcntl_async_signals(true);
+        } else {
+            declare(ticks=1);
         }
         
         $signals = [SIGINT, SIGTERM, SIGHUP];
@@ -695,7 +769,7 @@ class NetworkMonitor {
             $totalPackets = $data['rxPackets'] + $data['txPackets'];
             $totalErrors = $data['rxErrs'] + $data['txErrs'];
             
-            if ($totalPackets > 1000 && $totalPackets > 0 && ($totalErrors / $totalPackets) > $this->config['alert_threshold']) {
+            if ($totalPackets > 1000 && $totalPackets > 0 && ($totalErrors / $totalPackets) > $this->config->alert_threshold) {
                 $errorRate = round(($totalErrors / $totalPackets) * 100, 2);
                 $issues[] = "High error rate on $name: {$errorRate}%";
             }
@@ -710,7 +784,7 @@ class NetworkMonitor {
     }
 
     private function sortDeltas(&$deltas) {
-        switch ($this->config['sort_by']) {
+        switch ($this->config->sort_by) {
             case 'tx_rate':
                 uasort($deltas, function($a, $b) {
                     return $b['txRate'] <=> $a['txRate'];
@@ -743,12 +817,12 @@ class NetworkMonitor {
             $flagsDisplay = $this->formatFlags($flags);
             
             $avgRates = $this->getAverageRates($name);
-            $avgInfo = $this->config['show_averages'] ? 
+            $avgInfo = $this->config->show_averages ? 
                 sprintf(" [Avg: %s/%s]", $this->formatRate($avgRates['rx']), $this->formatRate($avgRates['tx'])) : "";
 
             $details = $this->getInterfaceDetails($name);
             $detailsInfo = "";
-            if ($this->config['show_details'] && !empty($details)) {
+            if ($this->config->show_details && !empty($details)) {
                 $detailParts = [];
                 if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
                 if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
@@ -765,7 +839,7 @@ class NetworkMonitor {
                 $this->colorGreen, $this->formatRate($data['rxRate']), $this->colorReset,
                 $this->colorYellow, $this->formatRate($data['txRate']), $this->colorReset);
             
-            if ($this->config['show_errors'] && ($data['rxErrs'] > 0 || $data['txErrs'] > 0)) {
+            if ($this->config->show_errors && ($data['rxErrs'] > 0 || $data['txErrs'] > 0)) {
                 printf("  %sErrors: RX%.0f TX%.0f Drop: RX%.0f TX%.0f%s\n",
                     $this->colorRed, $data['rxErrs'], $data['txErrs'], 
                     $data['rxDrop'], $data['txDrop'], $this->colorReset);
@@ -788,7 +862,7 @@ class NetworkMonitor {
             $this->formatRate($metrics['peak_rx_rate']),
             $this->formatRate($metrics['peak_tx_rate']));
         
-        if ($this->config['show_gateway'] && $gateway) {
+        if ($this->config->show_gateway && $gateway) {
             printf(" | Gateway: %s%s%s",
                 $this->colorCyan, $gateway['ip'], $this->colorReset);
         }
@@ -796,27 +870,6 @@ class NetworkMonitor {
         printf(" | %s\n", date('H:i:s'));
         
         echo $this->colorGrey . "[ctrl+c to stop]" . $this->colorReset . "\n";
-    }
-
-    private function getSystemLoad() {
-        if (file_exists('/proc/loadavg')) {
-            $load = $this->safeFileRead('/proc/loadavg');
-            return floatval(explode(' ', $load)[0]);
-        }
-        return 0.0;
-    }
-
-    private function adaptiveSleep($interval, $startTime) {
-        $elapsed = microtime(true) - $startTime;
-        $sleepTime = ($interval - $elapsed) * 1000000;
-        
-        if ($sleepTime > 1000) {
-            $load = $this->getSystemLoad();
-            if ($load > 2.0) {
-                $sleepTime = max(1000, $sleepTime * 0.5);
-            }
-            usleep((int)$sleepTime);
-        }
     }
 
     private function adaptiveSleepWithProgress($interval) {
@@ -906,7 +959,7 @@ class NetworkMonitor {
                 continue;
             }
 
-            if ($displayed >= $this->config['max_interfaces']) {
+            if ($displayed >= $this->config->max_interfaces) {
                 break;
             }
 
@@ -944,7 +997,7 @@ class NetworkMonitor {
             echo $this->colorGrey . "No active interfaces found." . $this->colorReset . "\n";
         }
         
-        if ($this->config['show_gateway'] && $gateway) {
+        if ($this->config->show_gateway && $gateway) {
             printf("%sDefault Gateway: %s via %s%s\n",
                 $this->colorCyan, $gateway['ip'], $gateway['interface'], $this->colorReset);
         }
@@ -953,16 +1006,43 @@ class NetworkMonitor {
     }
 
     private function handleOptions($options) {
+        $configUpdates = [];
+        
         if (isset($options['debug'])) {
             $this->debug = true;
         }
 
         if (isset($options['interval'])) {
-            $this->config['interval'] = $this->validateNumericValue($options['interval'], 'interval');
+            $configUpdates['interval'] = $this->validateNumericValue($options['interval'], 'interval');
         }
 
         if (isset($options['no-loopback'])) {
-            $this->config['show_loopback'] = false;
+            $configUpdates['show_loopback'] = false;
+        }
+
+        if (isset($options['show-inactive'])) {
+            $configUpdates['show_inactive'] = true;
+        }
+
+        if (isset($options['units']) && in_array($options['units'], ['binary', 'decimal'])) {
+            $configUpdates['units'] = $options['units'];
+        }
+
+        if (isset($options['sort-by']) && in_array($options['sort-by'], ['rx_rate', 'tx_rate', 'name'])) {
+            $configUpdates['sort_by'] = $options['sort-by'];
+        }
+
+        if (isset($options['show-details'])) {
+            $configUpdates['show_details'] = true;
+        }
+
+        if (isset($options['show-gateway'])) {
+            $configUpdates['show_gateway'] = true;
+        }
+
+        if (!empty($configUpdates)) {
+            $this->config = new NetworkMonitorConfig(array_merge(get_object_vars($this->config), $configUpdates));
+            $this->validateConfig();
         }
     }
 
@@ -971,32 +1051,9 @@ class NetworkMonitor {
             $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:', 'show-details', 'show-gateway']);
             
             $this->handleOptions($options);
-            
-            if (isset($options['show-inactive'])) {
-                $this->config['show_inactive'] = true;
-            }
-
-            if (isset($options['units']) && in_array($options['units'], ['binary', 'decimal'])) {
-                $this->config['units'] = $options['units'];
-            }
-
-            if (isset($options['sort-by']) && in_array($options['sort-by'], ['rx_rate', 'tx_rate', 'name'])) {
-                $this->config['sort_by'] = $options['sort-by'];
-            }
-
-            if (isset($options['show-details'])) {
-                $this->config['show_details'] = true;
-            }
-
-            if (isset($options['show-gateway'])) {
-                $this->config['show_gateway'] = true;
-            }
-
-            $this->validateConfig();
 
             if (isset($options['watch'])) {
-                set_time_limit(0);
-                $this->watch($this->config['interval']);
+                $this->watch($this->config->interval);
             } else {
                 $this->singleShotMode();
             }
