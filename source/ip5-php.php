@@ -145,40 +145,35 @@ class NetworkMonitor {
         return @shell_exec($escapedCommand);
     }
 
-    private function validateAndBuildPath($ifaceName, $filename) {
-        $this->validateInterfaceName($ifaceName);
-        $safeFilename = basename($filename);
-        $path = "/sys/class/net/" . $ifaceName . "/" . $safeFilename;
-        
-        return $path;
+    private function validateInterfaceName($ifaceName) {
+        if (!preg_match('/^[a-zA-Z0-9:_\.\-]{1,15}$/', $ifaceName)) {
+            throw new InvalidArgumentException("Invalid interface name: $ifaceName");
+        }
+        return $ifaceName;
     }
 
-    private function validateSysfsPath($path) {
+    private function validateAndBuildPath($ifaceName, $filename) {
+        $this->validateInterfaceName($ifaceName);
+        
+        $safeFilename = basename($filename);
+        $allowedFiles = [
+            'tx_bytes', 'rx_bytes', 'tx_packets', 'rx_packets',
+            'tx_errors', 'rx_errors', 'tx_dropped', 'rx_dropped',
+            'operstate', 'carrier', 'speed', 'mtu', 'duplex'
+        ];
+        
+        if (!in_array($safeFilename, $allowedFiles)) {
+            throw new InvalidArgumentException("Invalid filename: $filename");
+        }
+        
+        $path = "/sys/class/net/" . $ifaceName . "/" . $safeFilename;
+        
         $normalizedPath = str_replace('//', '/', $path);
-        
         if (strpos($normalizedPath, '/sys/class/net/') !== 0) {
-            return false;
+            throw new InvalidArgumentException("Invalid path construction");
         }
         
-        $pathParts = explode('/', $normalizedPath);
-        if (count($pathParts) < 5) {
-            return false;
-        }
-        
-        $ifaceName = $pathParts[4];
-        if (!$this->validateInterfaceName($ifaceName)) {
-            return false;
-        }
-        
-        if (count($pathParts) > 5) {
-            $filename = $pathParts[5];
-            $allowedFiles = ['operstate', 'carrier', 'speed', 'mtu', 'duplex'];
-            if (!in_array($filename, $allowedFiles)) {
-                return false;
-            }
-        }
-        
-        return true;
+        return $path;
     }
 
     private function log($message, $level = 'INFO') {
@@ -197,13 +192,6 @@ class NetworkMonitor {
             throw new InvalidArgumentException("Invalid value for $fieldName: $value");
         }
         return (float)$value;
-    }
-
-    private function validateInterfaceName($ifaceName) {
-        if (!preg_match('/^[a-zA-Z0-9:_\.-]{1,15}$/', $ifaceName)) {
-            throw new InvalidArgumentException("Invalid interface name: $ifaceName");
-        }
-        return $ifaceName;
     }
 
     private function getDefaultGateway() {
@@ -270,9 +258,13 @@ class NetworkMonitor {
             if ($result) {
                 foreach (explode("\n", $result) as $line) {
                     if (preg_match('/^\d+:\s+(\S+)\s+inet\s+(\S+)/', $line, $matches)) {
-                        $iface = $this->validateInterfaceName($matches[1]);
-                        $ip = $matches[2];
-                        $ips[$iface][] = explode('/', $ip)[0];
+                        try {
+                            $iface = $this->validateInterfaceName($matches[1]);
+                            $ip = $matches[2];
+                            $ips[$iface][] = explode('/', $ip)[0];
+                        } catch (InvalidArgumentException $e) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -288,7 +280,11 @@ class NetworkMonitor {
             }
 
             foreach ($interfaces as $ifaceName => $ifaceData) {
-                $ifaceName = $this->validateInterfaceName($ifaceName);
+                try {
+                    $ifaceName = $this->validateInterfaceName($ifaceName);
+                } catch (InvalidArgumentException $e) {
+                    continue;
+                }
                 
                 if (!$this->config->show_loopback && $this->isLoopbackInterface($ifaceName, $ifaceData)) {
                     continue;
@@ -331,11 +327,11 @@ class NetworkMonitor {
         
         try {
             $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
-            if (file_exists($operstatePath) && $this->validateSysfsPath($operstatePath)) {
+            if (file_exists($operstatePath)) {
                 $operstate = trim($this->safeFileRead($operstatePath));
                 if ($operstate === 'unknown' || $operstate === 'down') {
                     $carrierPath = $this->validateAndBuildPath($ifaceName, 'carrier');
-                    if (file_exists($carrierPath) && $this->validateSysfsPath($carrierPath)) {
+                    if (file_exists($carrierPath)) {
                         $carrier = trim($this->safeFileRead($carrierPath));
                         if ($carrier === '1') {
                             return true;
@@ -366,11 +362,8 @@ class NetworkMonitor {
     }
 
     private function getInterfaceState($ifaceName) {
-        $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
         try {
-            if (!$this->validateSysfsPath($operstatePath)) {
-                return 'unknown';
-            }
+            $operstatePath = $this->validateAndBuildPath($ifaceName, 'operstate');
             return trim($this->safeFileRead($operstatePath));
         } catch (Exception $e) {
             return 'unknown';
@@ -408,7 +401,7 @@ class NetworkMonitor {
         foreach ($filesToCheck as $key => $filename) {
             try {
                 $path = $this->validateAndBuildPath($ifaceName, $filename);
-                if (file_exists($path) && $this->validateSysfsPath($path)) {
+                if (file_exists($path)) {
                     $value = trim($this->safeFileRead($path));
                     if ($key === 'speed' && is_numeric($value) && $value > 0) {
                         $details[$key] = (int)$value;
@@ -442,8 +435,10 @@ class NetworkMonitor {
         $state = $this->getInterfaceStateCached($ifaceName);
         if ($state === 'up') {
             $flags[] = 'UP';
-        } else {
+        } elseif ($state === 'down') {
             $flags[] = 'DOWN';
+        } else {
+            $flags[] = strtoupper($state);
         }
         
         return $flags;
@@ -521,7 +516,12 @@ class NetworkMonitor {
             if (empty($line)) continue;
 
             if (preg_match('/^(\S+?):\s*(.*)$/', $line, $matches)) {
-                $iface = $this->validateInterfaceName($matches[1]);
+                try {
+                    $iface = $this->validateInterfaceName($matches[1]);
+                } catch (InvalidArgumentException $e) {
+                    continue;
+                }
+                
                 $data = preg_split('/\s+/', trim($matches[2]));
                 
                 if (count($data) >= 16) {
@@ -919,7 +919,7 @@ class NetworkMonitor {
                 if (!empty($issues)) {
                     echo $this->colorRed . "Network Issues:\n";
                     foreach ($issues as $issue) {
-                        echo "  ⚠ $issue\n";
+                        echo "  ALERT: $issue\n";
                     }
                     echo $this->colorReset . "\n";
                 }
