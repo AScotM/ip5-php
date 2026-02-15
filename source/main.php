@@ -167,9 +167,9 @@ class NetworkMonitor {
 
     private function safeShellExec(string $command): ?string {
         $allowedCommands = [
-            'ip-addr' => ['ip', '-o', '-4', 'addr', 'show'],
-            'ip-route' => ['ip', 'route', 'show', 'default'],
-            'netstat' => ['netstat', '-rn']
+            ['ip', '-o', '-4', 'addr', 'show'],
+            ['ip', 'route', 'show', 'default'],
+            ['netstat', '-rn']
         ];
         
         $parts = preg_split('/\s+/', $command, -1, PREG_SPLIT_NO_EMPTY);
@@ -177,12 +177,9 @@ class NetworkMonitor {
             return null;
         }
         
-        $binary = $parts[0];
-        $args = array_slice($parts, 1);
-        
         $matched = false;
         foreach ($allowedCommands as $allowedArgs) {
-            if ($binary === $allowedArgs[0] && $args === array_slice($allowedArgs, 1)) {
+            if ($parts === $allowedArgs) {
                 $matched = true;
                 break;
             }
@@ -581,12 +578,21 @@ class NetworkMonitor {
         }
         
         $maxHistoryEntries = 60;
-        foreach ($this->rateHistory as $iface => &$history) {
-            if (count($history['rx']) > $maxHistoryEntries) {
-                $history['rx'] = array_slice($history['rx'], -$maxHistoryEntries);
-                $history['tx'] = array_slice($history['tx'], -$maxHistoryEntries);
+        $newHistory = [];
+        foreach ($this->rateHistory as $iface => $history) {
+            $rxCount = count($history['rx']);
+            $txCount = count($history['tx']);
+            
+            if ($rxCount > $maxHistoryEntries || $txCount > $maxHistoryEntries) {
+                $newHistory[$iface] = [
+                    'rx' => array_slice($history['rx'], -$maxHistoryEntries),
+                    'tx' => array_slice($history['tx'], -$maxHistoryEntries)
+                ];
+            } else {
+                $newHistory[$iface] = $history;
             }
         }
+        $this->rateHistory = $newHistory;
         
         if (count($this->interfaceDetailsCache) > 100) {
             $this->interfaceDetailsCache = array_slice($this->interfaceDetailsCache, -50, null, true);
@@ -648,52 +654,54 @@ class NetworkMonitor {
             throw new RuntimeException('Failed to open /proc/net/dev');
         }
 
-        fgets($handle);
-        fgets($handle);
+        try {
+            fgets($handle);
+            fgets($handle);
 
-        $interfaceCount = 0;
+            $interfaceCount = 0;
 
-        while (($line = fgets($handle)) !== false && $interfaceCount < $this->config->max_interfaces) {
-            $line = trim($line);
-            if (empty($line)) continue;
+            while (($line = fgets($handle)) !== false && $interfaceCount < $this->config->max_interfaces) {
+                $line = trim($line);
+                if (empty($line)) continue;
 
-            if (preg_match('/^(\S+?):\s*(.*)$/', $line, $matches)) {
-                try {
-                    $iface = $this->validateInterfaceName($matches[1]);
-                } catch (InvalidArgumentException $e) {
-                    continue;
-                }
-                
-                $data = preg_split('/\s+/', trim($matches[2]));
-                
-                if (count($data) >= 16) {
+                if (preg_match('/^(\S+?):\s*(.*)$/', $line, $matches)) {
                     try {
-                        $stats[$iface] = [
-                            'name' => $iface,
-                            'rxBytes' => $this->validateNumericValue($data[0], 'rxBytes'),
-                            'rxPackets' => $this->validateNumericValue($data[1], 'rxPackets'),
-                            'rxErrs' => $this->validateNumericValue($data[2], 'rxErrs'),
-                            'rxDrop' => $this->validateNumericValue($data[3], 'rxDrop'),
-                            'txBytes' => $this->validateNumericValue($data[8], 'txBytes'),
-                            'txPackets' => $this->validateNumericValue($data[9], 'txPackets'),
-                            'txErrs' => $this->validateNumericValue($data[10], 'txErrs'),
-                            'txDrop' => $this->validateNumericValue($data[11], 'txDrop')
-                        ];
-                        $interfaceCount++;
+                        $iface = $this->validateInterfaceName($matches[1]);
                     } catch (InvalidArgumentException $e) {
-                        $this->log("Invalid data for interface $iface: " . $e->getMessage());
+                        continue;
+                    }
+                    
+                    $data = preg_split('/\s+/', trim($matches[2]));
+                    
+                    if (count($data) >= 16) {
+                        try {
+                            $stats[$iface] = [
+                                'name' => $iface,
+                                'rxBytes' => $this->validateNumericValue($data[0], 'rxBytes'),
+                                'rxPackets' => $this->validateNumericValue($data[1], 'rxPackets'),
+                                'rxErrs' => $this->validateNumericValue($data[2], 'rxErrs'),
+                                'rxDrop' => $this->validateNumericValue($data[3], 'rxDrop'),
+                                'txBytes' => $this->validateNumericValue($data[8], 'txBytes'),
+                                'txPackets' => $this->validateNumericValue($data[9], 'txPackets'),
+                                'txErrs' => $this->validateNumericValue($data[10], 'txErrs'),
+                                'txDrop' => $this->validateNumericValue($data[11], 'txDrop')
+                            ];
+                            $interfaceCount++;
+                        } catch (InvalidArgumentException $e) {
+                            $this->log("Invalid data for interface $iface: " . $e->getMessage());
+                        }
                     }
                 }
             }
+
+            if (empty($stats)) {
+                throw new RuntimeException('No valid interface data found in /proc/net/dev');
+            }
+
+            return $stats;
+        } finally {
+            fclose($handle);
         }
-
-        fclose($handle);
-
-        if (empty($stats)) {
-            throw new RuntimeException('No valid interface data found in /proc/net/dev');
-        }
-
-        return $stats;
     }
 
     private function formatBytes(float $bytes): string {
@@ -798,7 +806,12 @@ class NetworkMonitor {
             $this->signalHandler($signo);
         };
         
-        $signals = [SIGINT, SIGTERM, SIGHUP];
+        $signals = [
+            defined('SIGINT') ? SIGINT : 2,
+            defined('SIGTERM') ? SIGTERM : 15,
+            defined('SIGHUP') ? SIGHUP : 1
+        ];
+        
         foreach ($signals as $signal) {
             if (!pcntl_signal($signal, $handler)) {
                 $this->log("Failed to set handler for signal $signal");
@@ -914,9 +927,11 @@ class NetworkMonitor {
             $totalPackets = $data['rxPackets'] + $data['txPackets'];
             $totalErrors = $data['rxErrs'] + $data['txErrs'];
             
-            if ($totalPackets > 1000 && $totalPackets > 0 && ($totalErrors / $totalPackets) > $this->config->alert_threshold) {
-                $errorRate = round(($totalErrors / $totalPackets) * 100, 2);
-                $issues[] = "High error rate on $name: {$errorRate}%";
+            if ($totalPackets > 1000) {
+                $errorRate = $totalErrors / $totalPackets;
+                if ($errorRate > $this->config->alert_threshold) {
+                    $issues[] = sprintf("High error rate on %s: %.2f%%", $name, $errorRate * 100);
+                }
             }
             
             $state = $this->getInterfaceStateCached($name);
