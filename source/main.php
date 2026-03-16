@@ -53,7 +53,7 @@ class NetworkMonitor {
     private array $interfaceDetailsCache = [];
     private ?array $gatewayCache = null;
     private ?int $gatewayCacheTime = null;
-    private array $deltas = [];
+    private array $currentData = [];
 
     private const MAX_HISTORY = 5;
     private const MAX_INTERVAL = 3600;
@@ -75,6 +75,7 @@ class NetworkMonitor {
     private const LOG_FILE = '/var/log/network-monitor.log';
     private const LOG_MAX_SIZE = 10485760;
     private const CONFIG_FILE = '/etc/network-monitor.conf';
+    private const UINT64_MAX = 18446744073709551615.0;
 
     public function __construct(array $config = []) {
         $this->checkPhpVersion();
@@ -155,7 +156,15 @@ class NetworkMonitor {
         if (file_exists(self::CONFIG_FILE)) {
             $loaded = parse_ini_file(self::CONFIG_FILE, true);
             if ($loaded !== false) {
-                $config = $loaded;
+                foreach ($loaded as $key => $value) {
+                    if (is_array($value)) {
+                        foreach ($value as $subKey => $subValue) {
+                            $config[$subKey] = $subValue;
+                        }
+                    } else {
+                        $config[$key] = $value;
+                    }
+                }
                 $this->log("Loaded configuration from " . self::CONFIG_FILE);
             }
         }
@@ -392,11 +401,19 @@ class NetworkMonitor {
             try {
                 $result = $this->safeShellExec('netstat -rn');
                 if ($result) {
-                    foreach (explode("\n", $result) as $line) {
-                        if (preg_match('/^0\.0\.0\.0\s+(\S+)\s+.*?(\S+)$/', $line, $matches)) {
+                    $lines = explode("\n", $result);
+                    $foundHeader = false;
+                    
+                    foreach ($lines as $line) {
+                        if (!$foundHeader && preg_match('/^Kernel IP routing table/', $line)) {
+                            $foundHeader = true;
+                            continue;
+                        }
+                        
+                        if ($foundHeader && preg_match('/^0\.0\.0\.0\s+(\S+)\s+0\.0\.0\.0\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/', $line, $matches)) {
                             $gateway = [
                                 'ip' => $matches[1],
-                                'interface' => $matches[2]
+                                'interface' => $matches[5]
                             ];
                             break;
                         }
@@ -932,8 +949,10 @@ class NetworkMonitor {
         if ($curr >= $prev) {
             return $curr - $prev;
         } else {
-            $maxUint64 = PHP_INT_MAX;
-            return ($maxUint64 - $prev) + $curr + 1;
+            if (PHP_INT_SIZE === 8 && $prev > PHP_INT_MAX) {
+                return (self::UINT64_MAX - $prev) + $curr + 1;
+            }
+            return (PHP_INT_MAX - $prev) + $curr + 1;
         }
     }
 
@@ -1034,7 +1053,7 @@ class NetworkMonitor {
     }
 
     private function displayEnhancedDeltas(array $deltas): void {
-        $this->deltas = $deltas;
+        $this->currentData = $deltas;
         $ipMap = $this->getInterfaceIPs();
         $metrics = $this->calculateAdvancedMetrics($deltas);
         $gateway = $this->getDefaultGateway();
@@ -1121,16 +1140,38 @@ class NetworkMonitor {
         echo "\r" . str_repeat(' ', 50) . "\r";
     }
 
+    private function collectData(float $interval): array {
+        $gateway = $this->getDefaultGateway();
+        $stats = $this->getCachedStats();
+        
+        if (empty($this->prevStats)) {
+            $this->prevStats[] = $stats;
+            return ['gateway' => $gateway, 'stats' => $stats, 'deltas' => []];
+        }
+        
+        $prev = end($this->prevStats);
+        $deltas = $this->calculateDelta($prev, $stats, $interval);
+        
+        return [
+            'gateway' => $gateway,
+            'stats' => $stats,
+            'deltas' => $deltas,
+            'issues' => $this->detectNetworkIssues($deltas),
+            'metrics' => $this->calculateAdvancedMetrics($deltas),
+            'ips' => $this->getInterfaceIPs()
+        ];
+    }
+
     public function watch(float $interval): void {
         $this->log("Starting watch mode with interval: {$interval}s");
         
         $this->setupSignalHandlers();
         $iteration = 0;
         $startTime = time();
-        $gateway = $this->getDefaultGateway();
 
         try {
             $prev = $this->parseProcNetDev();
+            $this->prevStats[] = $prev;
         } catch (Exception $e) {
             throw new RuntimeException("Failed to initialize monitoring: " . $e->getMessage());
         }
@@ -1141,38 +1182,51 @@ class NetworkMonitor {
             $uptime = $currentTime - $startTime;
             
             $this->checkResourceUsage();
-            $this->header($gateway);
-            printf("Uptime: %ds | Iteration: %d | %s\n\n", 
-                   $uptime, $iteration, date('Y-m-d H:i:s'));
+            
+            if (!isset($options['json'])) {
+                $this->header($this->getDefaultGateway());
+                printf("Uptime: %ds | Iteration: %d | %s\n\n", 
+                       $uptime, $iteration, date('Y-m-d H:i:s'));
+            }
 
             try {
                 $this->cleanupCaches();
-                $curr = $this->getCachedStats();
-                $deltas = $this->calculateDelta($prev, $curr, $interval);
+                $data = $this->collectData($interval);
                 
-                $issues = $this->detectNetworkIssues($deltas);
-                if (!empty($issues)) {
-                    echo $this->colorRed . "Network Issues:\n";
-                    foreach ($issues as $issue) {
-                        echo "  ALERT: $issue\n";
+                if (isset($options['json'])) {
+                    $this->outputJson($data);
+                } else {
+                    if (!empty($data['issues'])) {
+                        echo $this->colorRed . "Network Issues:\n";
+                        foreach ($data['issues'] as $issue) {
+                            echo "  ALERT: $issue\n";
+                        }
+                        echo $this->colorReset . "\n";
                     }
-                    echo $this->colorReset . "\n";
+                    
+                    $this->displayEnhancedDeltas($data['deltas']);
                 }
                 
-                $this->displayEnhancedDeltas($deltas);
-                $prev = $curr;
-                $this->manageHistory($curr);
+                $this->manageHistory($data['stats']);
             } catch (Exception $e) {
                 $this->log("Monitoring error: " . $e->getMessage());
-                echo $this->colorRed . "Read error: " . $this->getUserFriendlyMessage($e->getMessage()) . $this->colorReset . "\n";
+                if (!isset($options['json'])) {
+                    echo $this->colorRed . "Read error: " . $this->getUserFriendlyMessage($e->getMessage()) . $this->colorReset . "\n";
+                }
             }
 
             if ($this->shouldExit) break;
 
-            $this->adaptiveSleepWithProgress($interval);
+            if (!isset($options['json'])) {
+                $this->adaptiveSleepWithProgress($interval);
+            } else {
+                usleep((int)($interval * 1000000));
+            }
         }
 
-        echo "\n" . $this->colorGrey . "Exiting after $iteration iterations..." . $this->colorReset . "\n";
+        if (!isset($options['json'])) {
+            echo "\n" . $this->colorGrey . "Exiting after $iteration iterations..." . $this->colorReset . "\n";
+        }
     }
 
     private function getUserFriendlyMessage(string $message): string {
@@ -1191,22 +1245,34 @@ class NetworkMonitor {
         return $message;
     }
 
+    private function outputJson(array $data): void {
+        $output = [
+            'timestamp' => time(),
+            'gateway' => $data['gateway'],
+            'interfaces' => $data['deltas'],
+            'issues' => $data['issues'] ?? [],
+            'metrics' => $data['metrics'] ?? [],
+            'ip_addresses' => $data['ips'] ?? []
+        ];
+        
+        echo json_encode($output) . "\n";
+    }
+
     private function singleShotMode(): void {
         $this->log("Running in single shot mode");
         
-        $gateway = $this->getDefaultGateway();
-        $this->header($gateway);
+        $data = $this->collectData($this->config->interval);
         
-        try {
-            $stats = $this->parseProcNetDev();
-        } catch (Exception $e) {
-            throw new RuntimeException("Failed to read network statistics: " . $e->getMessage());
+        if (isset($options['json'])) {
+            $this->outputJson($data);
+            return;
         }
         
-        $ipMap = $this->getInterfaceIPs();
+        $this->header($data['gateway']);
+        
         $displayed = 0;
         
-        foreach ($stats as $s) {
+        foreach ($data['stats'] as $s) {
             if (!$this->shouldShowInterface($s['name'], $s)) {
                 continue;
             }
@@ -1215,7 +1281,7 @@ class NetworkMonitor {
                 break;
             }
 
-            $ips = $ipMap[$s['name']] ?? [];
+            $ips = $data['ips'][$s['name']] ?? [];
             $ipInfo = "";
             if (!empty($ips)) {
                 $ipInfo = " - " . $this->colorGrey . implode(', ', $ips) . $this->colorReset;
@@ -1249,28 +1315,12 @@ class NetworkMonitor {
             echo $this->colorGrey . "No active interfaces found." . $this->colorReset . "\n";
         }
         
-        if ($this->config->show_gateway && $gateway) {
+        if ($this->config->show_gateway && $data['gateway']) {
             printf("%sDefault Gateway: %s via %s%s\n",
-                $this->colorCyan, $gateway['ip'], $gateway['interface'], $this->colorReset);
+                $this->colorCyan, $data['gateway']['ip'], $data['gateway']['interface'], $this->colorReset);
         }
         
         echo $this->colorGrey . "Invoke with --watch for live view." . $this->colorReset . "\n";
-    }
-
-    private function exportJson(): void {
-        if (empty($this->deltas)) {
-            echo json_encode(['error' => 'No data available']) . "\n";
-            return;
-        }
-        
-        $output = [
-            'timestamp' => time(),
-            'interfaces' => $this->deltas,
-            'summary' => $this->calculateAdvancedMetrics($this->deltas),
-            'gateway' => $this->getDefaultGateway()
-        ];
-        
-        echo json_encode($output, JSON_PRETTY_PRINT) . "\n";
     }
 
     private function handleOptions(array $options): void {
@@ -1308,10 +1358,6 @@ class NetworkMonitor {
             $configUpdates['show_gateway'] = true;
         }
 
-        if (isset($options['json'])) {
-            $this->config->show_gateway = true;
-        }
-
         if (!empty($configUpdates)) {
             $this->config = new NetworkMonitorConfig(array_merge(get_object_vars($this->config), $configUpdates));
             $this->validateConfig();
@@ -1320,19 +1366,12 @@ class NetworkMonitor {
 
     public function run(): void {
         try {
+            global $options;
             $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:', 'show-details', 'show-gateway', 'json']);
             
             $this->handleOptions($options);
 
-            if (isset($options['json'])) {
-                if (isset($options['watch'])) {
-                    $this->watch($this->config->interval);
-                    $this->exportJson();
-                } else {
-                    $this->singleShotMode();
-                    $this->exportJson();
-                }
-            } elseif (isset($options['watch'])) {
+            if (isset($options['watch'])) {
                 $this->watch($this->config->interval);
             } else {
                 $this->singleShotMode();
