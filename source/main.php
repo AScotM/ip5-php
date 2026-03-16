@@ -53,6 +53,7 @@ class NetworkMonitor {
     private array $interfaceDetailsCache = [];
     private ?array $gatewayCache = null;
     private ?int $gatewayCacheTime = null;
+    private array $deltas = [];
 
     private const MAX_HISTORY = 5;
     private const MAX_INTERVAL = 3600;
@@ -61,13 +62,35 @@ class NetworkMonitor {
     private const MAX_FILE_SIZE = 8192;
     private const MAX_RETRIES = 3;
     private const RETRY_DELAY = 100000;
+    private const CACHE_CLEANUP_THRESHOLD = 100;
+    private const CACHE_TRIM_SIZE = 50;
+    private const MAX_CACHE_AGE = 300;
+    private const MAX_HISTORY_ENTRIES = 60;
+    private const MEMORY_LIMIT_MB = 128;
+    private const MEMORY_WARNING_MB = 32;
+    private const RESOURCE_CHECK_INTERVAL = 10;
+    private const GC_INTERVAL = 60;
+    private const PROGRESS_STEPS = 10;
+    private const MIN_SLEEP_STEP_US = 10000;
+    private const LOG_FILE = '/var/log/network-monitor.log';
+    private const LOG_MAX_SIZE = 10485760;
+    private const CONFIG_FILE = '/etc/network-monitor.conf';
 
     public function __construct(array $config = []) {
+        $this->checkPhpVersion();
         $this->checkPlatformCompatibility();
         $this->initializeOutput();
+        $config = array_merge($this->loadConfigFile(), $config);
         $this->config = new NetworkMonitorConfig($config);
         $this->validateConfig();
         $this->enforceResourceLimits();
+        $this->checkOpcache();
+    }
+
+    private function checkPhpVersion(): void {
+        if (version_compare(PHP_VERSION, '8.0.0', '<')) {
+            throw new RuntimeException("PHP 8.0 or higher is required. Current version: " . PHP_VERSION);
+        }
     }
 
     private function checkPlatformCompatibility(): void {
@@ -127,11 +150,32 @@ class NetworkMonitor {
         }
     }
 
+    private function loadConfigFile(): array {
+        $config = [];
+        if (file_exists(self::CONFIG_FILE)) {
+            $loaded = parse_ini_file(self::CONFIG_FILE, true);
+            if ($loaded !== false) {
+                $config = $loaded;
+                $this->log("Loaded configuration from " . self::CONFIG_FILE);
+            }
+        }
+        return $config;
+    }
+
     private function enforceResourceLimits(): void {
-        ini_set('memory_limit', '128M');
+        ini_set('memory_limit', self::MEMORY_LIMIT_MB . 'M');
         
         if (function_exists('set_time_limit')) {
             set_time_limit(0);
+        }
+    }
+
+    private function checkOpcache(): void {
+        if (function_exists('opcache_get_status')) {
+            $status = opcache_get_status(false);
+            if ($status !== false) {
+                $this->log("Opcache enabled: " . ($status['opcache_enabled'] ? 'yes' : 'no'));
+            }
         }
     }
 
@@ -148,16 +192,34 @@ class NetworkMonitor {
             throw new RuntimeException("Path is a directory: $path");
         }
         
+        $handle = @fopen($path, 'rb');
+        if (!$handle) {
+            throw new RuntimeException("Failed to open file: $path");
+        }
+        
+        if (!flock($handle, LOCK_SH)) {
+            fclose($handle);
+            throw new RuntimeException("Failed to lock file: $path");
+        }
+        
         $size = filesize($path);
         if ($size === false) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
             throw new RuntimeException("Cannot determine file size: $path");
         }
         
         if ($size > self::MAX_FILE_SIZE) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
             throw new RuntimeException("File too large: $path");
         }
         
-        $content = @file_get_contents($path, false, null, 0, self::MAX_FILE_SIZE);
+        $content = stream_get_contents($handle, self::MAX_FILE_SIZE);
+        
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        
         if ($content === false) {
             throw new RuntimeException("Failed to read file: $path");
         }
@@ -167,25 +229,12 @@ class NetworkMonitor {
 
     private function safeShellExec(string $command): ?string {
         $allowedCommands = [
-            ['ip', '-o', '-4', 'addr', 'show'],
-            ['ip', 'route', 'show', 'default'],
-            ['netstat', '-rn']
+            'ip -o -4 addr show',
+            'ip route show default',
+            'netstat -rn'
         ];
         
-        $parts = preg_split('/\s+/', $command, -1, PREG_SPLIT_NO_EMPTY);
-        if (empty($parts)) {
-            return null;
-        }
-        
-        $matched = false;
-        foreach ($allowedCommands as $allowedArgs) {
-            if ($parts === $allowedArgs) {
-                $matched = true;
-                break;
-            }
-        }
-        
-        if (!$matched) {
+        if (!in_array($command, $allowedCommands, true)) {
             throw new InvalidArgumentException("Command not allowed: $command");
         }
         
@@ -269,17 +318,41 @@ class NetworkMonitor {
 
     private function log(string $message, string $level = 'INFO'): void {
         if ($this->debug) {
-            file_put_contents('php://stderr', 
-                date('Y-m-d H:i:s') . " [$level] $message\n", FILE_APPEND);
+            $logMessage = date('Y-m-d H:i:s') . " [$level] $message\n";
+            
+            if (file_exists(self::LOG_FILE) && filesize(self::LOG_FILE) > self::LOG_MAX_SIZE) {
+                $rotated = self::LOG_FILE . '.' . date('YmdHis');
+                rename(self::LOG_FILE, $rotated);
+            }
+            
+            file_put_contents(self::LOG_FILE, $logMessage, FILE_APPEND);
+            file_put_contents('php://stderr', $logMessage, FILE_APPEND);
         }
     }
 
     private function error(string $message): void {
-        if ($this->useColors) {
-            echo $this->colorRed . "Error: " . $message . $this->colorReset . "\n";
-        } else {
-            echo "Error: " . $message . "\n";
+        $userMessages = [
+            'File does not exist' => 'Network interface statistics not available',
+            'Permission denied' => 'Insufficient permissions to read network statistics',
+            'Command not allowed' => 'Security restriction prevented command execution',
+            'Invalid interface' => 'Network interface validation failed'
+        ];
+        
+        $displayMessage = $message;
+        foreach ($userMessages as $tech => $user) {
+            if (strpos($message, $tech) !== false) {
+                $displayMessage = $user;
+                break;
+            }
         }
+        
+        if ($this->useColors) {
+            echo $this->colorRed . "Error: " . $displayMessage . $this->colorReset . "\n";
+        } else {
+            echo "Error: " . $displayMessage . "\n";
+        }
+        
+        $this->log($message, 'ERROR');
     }
 
     private function validateNumericValue(string $value, string $fieldName): float {
@@ -470,8 +543,8 @@ class NetworkMonitor {
         $state = $this->getInterfaceState($ifaceName);
         $this->stateCache[$ifaceName] = $state;
         
-        if (count($this->stateCache) > 100) {
-            $this->stateCache = array_slice($this->stateCache, -50, null, true);
+        if (count($this->stateCache) > self::CACHE_CLEANUP_THRESHOLD) {
+            $this->stateCache = array_slice($this->stateCache, -self::CACHE_TRIM_SIZE, null, true);
         }
         
         return $state;
@@ -510,8 +583,8 @@ class NetworkMonitor {
 
         $this->interfaceDetailsCache[$ifaceName] = $details;
         
-        if (count($this->interfaceDetailsCache) > 100) {
-            $this->interfaceDetailsCache = array_slice($this->interfaceDetailsCache, -50, null, true);
+        if (count($this->interfaceDetailsCache) > self::CACHE_CLEANUP_THRESHOLD) {
+            $this->interfaceDetailsCache = array_slice($this->interfaceDetailsCache, -self::CACHE_TRIM_SIZE, null, true);
         }
         
         return $details;
@@ -545,14 +618,14 @@ class NetworkMonitor {
         static $lastCheck = 0;
         $now = time();
         
-        if ($now - $lastCheck < 10) {
+        if ($now - $lastCheck < self::RESOURCE_CHECK_INTERVAL) {
             return;
         }
         
         $lastCheck = $now;
         
         $memory = memory_get_usage(true) / 1024 / 1024;
-        if ($memory > 32) {
+        if ($memory > self::MEMORY_WARNING_MB) {
             $this->log("High memory usage: {$memory}MB");
             $this->cleanupCaches();
         }
@@ -570,23 +643,21 @@ class NetworkMonitor {
 
     private function cleanupCaches(): void {
         $now = time();
-        $maxCacheAge = 300;
         
-        if ($this->statCacheTime && ($now - $this->statCacheTime) > $maxCacheAge) {
+        if ($this->statCacheTime && ($now - $this->statCacheTime) > self::MAX_CACHE_AGE) {
             $this->statCache = null;
             $this->statCacheTime = null;
         }
         
-        $maxHistoryEntries = 60;
         $newHistory = [];
         foreach ($this->rateHistory as $iface => $history) {
             $rxCount = count($history['rx']);
             $txCount = count($history['tx']);
             
-            if ($rxCount > $maxHistoryEntries || $txCount > $maxHistoryEntries) {
+            if ($rxCount > self::MAX_HISTORY_ENTRIES || $txCount > self::MAX_HISTORY_ENTRIES) {
                 $newHistory[$iface] = [
-                    'rx' => array_slice($history['rx'], -$maxHistoryEntries),
-                    'tx' => array_slice($history['tx'], -$maxHistoryEntries)
+                    'rx' => array_slice($history['rx'], -self::MAX_HISTORY_ENTRIES),
+                    'tx' => array_slice($history['tx'], -self::MAX_HISTORY_ENTRIES)
                 ];
             } else {
                 $newHistory[$iface] = $history;
@@ -594,12 +665,12 @@ class NetworkMonitor {
         }
         $this->rateHistory = $newHistory;
         
-        if (count($this->interfaceDetailsCache) > 100) {
-            $this->interfaceDetailsCache = array_slice($this->interfaceDetailsCache, -50, null, true);
+        if (count($this->interfaceDetailsCache) > self::CACHE_CLEANUP_THRESHOLD) {
+            $this->interfaceDetailsCache = array_slice($this->interfaceDetailsCache, -self::CACHE_TRIM_SIZE, null, true);
         }
         
         static $lastGc = 0;
-        if ($now - $lastGc > 60) {
+        if ($now - $lastGc > self::GC_INTERVAL) {
             gc_collect_cycles();
             $lastGc = $now;
         }
@@ -963,6 +1034,7 @@ class NetworkMonitor {
     }
 
     private function displayEnhancedDeltas(array $deltas): void {
+        $this->deltas = $deltas;
         $ipMap = $this->getInterfaceIPs();
         $metrics = $this->calculateAdvancedMetrics($deltas);
         $gateway = $this->getDefaultGateway();
@@ -1033,8 +1105,8 @@ class NetworkMonitor {
     }
 
     private function adaptiveSleepWithProgress(float $interval): void {
-        $sleepSteps = 10;
-        $stepDuration = ($interval * 1000000) / $sleepSteps;
+        $sleepSteps = self::PROGRESS_STEPS;
+        $stepDuration = max(self::MIN_SLEEP_STEP_US, ($interval * 1000000) / $sleepSteps);
         
         for ($i = 0; $i < $sleepSteps; $i++) {
             if ($this->shouldExit) break;
@@ -1092,7 +1164,7 @@ class NetworkMonitor {
                 $this->manageHistory($curr);
             } catch (Exception $e) {
                 $this->log("Monitoring error: " . $e->getMessage());
-                echo $this->colorRed . "Read error: " . $e->getMessage() . $this->colorReset . "\n";
+                echo $this->colorRed . "Read error: " . $this->getUserFriendlyMessage($e->getMessage()) . $this->colorReset . "\n";
             }
 
             if ($this->shouldExit) break;
@@ -1101,6 +1173,22 @@ class NetworkMonitor {
         }
 
         echo "\n" . $this->colorGrey . "Exiting after $iteration iterations..." . $this->colorReset . "\n";
+    }
+
+    private function getUserFriendlyMessage(string $message): string {
+        $userMessages = [
+            'File does not exist' => 'Network statistics not available',
+            'Permission denied' => 'Insufficient permissions',
+            'Failed to open' => 'Cannot access network statistics'
+        ];
+        
+        foreach ($userMessages as $tech => $user) {
+            if (strpos($message, $tech) !== false) {
+                return $user;
+            }
+        }
+        
+        return $message;
     }
 
     private function singleShotMode(): void {
@@ -1169,6 +1257,22 @@ class NetworkMonitor {
         echo $this->colorGrey . "Invoke with --watch for live view." . $this->colorReset . "\n";
     }
 
+    private function exportJson(): void {
+        if (empty($this->deltas)) {
+            echo json_encode(['error' => 'No data available']) . "\n";
+            return;
+        }
+        
+        $output = [
+            'timestamp' => time(),
+            'interfaces' => $this->deltas,
+            'summary' => $this->calculateAdvancedMetrics($this->deltas),
+            'gateway' => $this->getDefaultGateway()
+        ];
+        
+        echo json_encode($output, JSON_PRETTY_PRINT) . "\n";
+    }
+
     private function handleOptions(array $options): void {
         $configUpdates = [];
         
@@ -1204,6 +1308,10 @@ class NetworkMonitor {
             $configUpdates['show_gateway'] = true;
         }
 
+        if (isset($options['json'])) {
+            $this->config->show_gateway = true;
+        }
+
         if (!empty($configUpdates)) {
             $this->config = new NetworkMonitorConfig(array_merge(get_object_vars($this->config), $configUpdates));
             $this->validateConfig();
@@ -1212,11 +1320,19 @@ class NetworkMonitor {
 
     public function run(): void {
         try {
-            $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:', 'show-details', 'show-gateway']);
+            $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:', 'show-details', 'show-gateway', 'json']);
             
             $this->handleOptions($options);
 
-            if (isset($options['watch'])) {
+            if (isset($options['json'])) {
+                if (isset($options['watch'])) {
+                    $this->watch($this->config->interval);
+                    $this->exportJson();
+                } else {
+                    $this->singleShotMode();
+                    $this->exportJson();
+                }
+            } elseif (isset($options['watch'])) {
                 $this->watch($this->config->interval);
             } else {
                 $this->singleShotMode();
