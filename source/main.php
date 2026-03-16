@@ -17,6 +17,7 @@ class NetworkMonitorConfig {
     public float $alert_threshold = 0.01;
     public bool $show_details = false;
     public bool $show_gateway = true;
+    public bool $json_output = false;
     
     public function __construct(array $options = []) {
         foreach ($options as $key => $value) {
@@ -26,6 +27,18 @@ class NetworkMonitorConfig {
             }
         }
     }
+}
+
+class NetworkMonitorData {
+    public function __construct(
+        public readonly array $stats,
+        public readonly array $deltas,
+        public readonly ?array $gateway,
+        public readonly array $ips,
+        public readonly array $issues,
+        public readonly array $metrics,
+        public readonly int $timestamp
+    ) {}
 }
 
 class NetworkMonitor {
@@ -53,7 +66,7 @@ class NetworkMonitor {
     private array $interfaceDetailsCache = [];
     private ?array $gatewayCache = null;
     private ?int $gatewayCacheTime = null;
-    private array $currentData = [];
+    private int $iteration = 0;
 
     private const MAX_HISTORY = 5;
     private const MAX_INTERVAL = 3600;
@@ -75,7 +88,7 @@ class NetworkMonitor {
     private const LOG_FILE = '/var/log/network-monitor.log';
     private const LOG_MAX_SIZE = 10485760;
     private const CONFIG_FILE = '/etc/network-monitor.conf';
-    private const UINT64_MAX = 18446744073709551615.0;
+    private const UINT64_MAX = '18446744073709551615';
 
     public function __construct(array $config = []) {
         $this->checkPhpVersion();
@@ -355,9 +368,9 @@ class NetworkMonitor {
             }
         }
         
-        if ($this->useColors) {
+        if (!$this->config->json_output && $this->useColors) {
             echo $this->colorRed . "Error: " . $displayMessage . $this->colorReset . "\n";
-        } else {
+        } elseif (!$this->config->json_output) {
             echo "Error: " . $displayMessage . "\n";
         }
         
@@ -792,6 +805,115 @@ class NetworkMonitor {
         }
     }
 
+    private function calculateMetrics(array $deltas): array {
+        $metrics = [
+            'total_rx_rate' => 0,
+            'total_tx_rate' => 0,
+            'peak_rx_rate' => 0,
+            'peak_tx_rate' => 0,
+            'interface_count' => count($deltas),
+            'active_interfaces' => 0
+        ];
+
+        foreach ($deltas as $data) {
+            $metrics['total_rx_rate'] += $data['rxRate'];
+            $metrics['total_tx_rate'] += $data['txRate'];
+            $metrics['peak_rx_rate'] = max($metrics['peak_rx_rate'], $data['rxRate']);
+            $metrics['peak_tx_rate'] = max($metrics['peak_tx_rate'], $data['txRate']);
+            
+            if ($data['rxRate'] > 0 || $data['txRate'] > 0) {
+                $metrics['active_interfaces']++;
+            }
+        }
+
+        return $metrics;
+    }
+
+    private function calculateCounterDelta(float $prev, float $curr): float {
+        if ($curr >= $prev) {
+            return $curr - $prev;
+        }
+        
+        if (PHP_INT_SIZE === 8) {
+            return (float)(bcsub(self::UINT64_MAX, (string)$prev) + $curr + 1);
+        }
+        
+        return (PHP_INT_MAX - $prev) + $curr + 1;
+    }
+
+    private function updateRateHistory(array $deltas): void {
+        foreach ($deltas as $name => $data) {
+            if (!isset($this->rateHistory[$name])) {
+                $this->rateHistory[$name] = ['rx' => [], 'tx' => []];
+            }
+            
+            $this->rateHistory[$name]['rx'][] = $data['rxRate'];
+            $this->rateHistory[$name]['tx'][] = $data['txRate'];
+        }
+    }
+
+    private function getAverageRates(string $ifaceName): array {
+        if (!isset($this->rateHistory[$ifaceName])) {
+            return ['rx' => 0, 'tx' => 0];
+        }
+
+        $rxRates = $this->rateHistory[$ifaceName]['rx'];
+        $txRates = $this->rateHistory[$ifaceName]['tx'];
+
+        if (empty($rxRates)) {
+            return ['rx' => 0, 'tx' => 0];
+        }
+
+        return [
+            'rx' => array_sum($rxRates) / count($rxRates),
+            'tx' => array_sum($txRates) / count($txRates)
+        ];
+    }
+
+    private function detectIssues(array $deltas): array {
+        $issues = [];
+        
+        foreach ($deltas as $name => $data) {
+            $totalPackets = $data['rxPackets'] + $data['txPackets'];
+            $totalErrors = $data['rxErrs'] + $data['txErrs'];
+            
+            if ($totalPackets > 1000) {
+                $errorRate = $totalErrors / $totalPackets;
+                if ($errorRate > $this->config->alert_threshold) {
+                    $issues[] = sprintf("High error rate on %s: %.2f%%", $name, $errorRate * 100);
+                }
+            }
+            
+            $state = $this->getInterfaceStateCached($name);
+            if ($state !== 'up' && ($data['rxBytes'] > 0 || $data['txBytes'] > 0)) {
+                $issues[] = "Interface $name is down but previously had traffic";
+            }
+        }
+        
+        return $issues;
+    }
+
+    private function collectData(bool $includeDeltas = true): NetworkMonitorData {
+        $stats = $this->getCachedStats();
+        $gateway = $this->getDefaultGateway();
+        $ips = $this->getInterfaceIPs();
+        $timestamp = time();
+        
+        $deltas = [];
+        $issues = [];
+        $metrics = [];
+        
+        if ($includeDeltas && !empty($this->prevStats)) {
+            $prev = end($this->prevStats);
+            $deltas = $this->calculateDelta($prev, $stats, $this->config->interval);
+            $issues = $this->detectIssues($deltas);
+            $metrics = $this->calculateMetrics($deltas);
+            $this->updateRateHistory($deltas);
+        }
+        
+        return new NetworkMonitorData($stats, $deltas, $gateway, $ips, $issues, $metrics, $timestamp);
+    }
+
     private function formatBytes(float $bytes): string {
         if ($this->config->units === 'decimal') {
             $units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -859,7 +981,7 @@ class NetworkMonitor {
         return '[' . implode(' ', $formatted) . ']';
     }
 
-    private function header(?array $gatewayInfo = null): void {
+    private function renderHeader(?array $gatewayInfo = null): void {
         if ($this->useColors) {
             echo $this->clearScreen;
         }
@@ -875,42 +997,176 @@ class NetworkMonitor {
         echo $this->colorGrey . "Monitoring interface statistics..." . $this->colorReset . "\n\n";
     }
 
-    private function signalHandler(int $signo): void {
-        $this->log("Received signal $signo, shutting down");
-        $this->shouldExit = true;
-    }
-
-    private function setupSignalHandlers(): void {
-        if (!extension_loaded('pcntl')) {
-            $this->log('PCNTL extension not available, signal handling disabled');
+    private function renderData(NetworkMonitorData $data): void {
+        if ($this->config->json_output) {
+            echo json_encode([
+                'timestamp' => $data->timestamp,
+                'gateway' => $data->gateway,
+                'interfaces' => $data->deltas,
+                'issues' => $data->issues,
+                'metrics' => $data->metrics,
+                'ip_addresses' => $data->ips
+            ]) . "\n";
             return;
         }
+
+        $this->renderHeader($data->gateway);
         
-        if (function_exists('pcntl_async_signals')) {
-            pcntl_async_signals(true);
+        if ($this->iteration > 0) {
+            printf("Uptime: %ds | Iteration: %d | %s\n\n", 
+                   time() - $this->iterationStart, $this->iteration, date('Y-m-d H:i:s'));
         }
-        
-        $handler = function($signo) {
-            $this->signalHandler($signo);
-        };
-        
-        $signals = [
-            defined('SIGINT') ? SIGINT : 2,
-            defined('SIGTERM') ? SIGTERM : 15,
-            defined('SIGHUP') ? SIGHUP : 1
-        ];
-        
-        foreach ($signals as $signal) {
-            if (!pcntl_signal($signal, $handler)) {
-                $this->log("Failed to set handler for signal $signal");
+
+        if (!empty($data->issues)) {
+            echo $this->colorRed . "Network Issues:\n";
+            foreach ($data->issues as $issue) {
+                echo "  ALERT: $issue\n";
             }
+            echo $this->colorReset . "\n";
+        }
+
+        if (empty($data->deltas)) {
+            $this->renderStats($data);
+        } else {
+            $this->renderDeltas($data);
         }
     }
 
-    private function manageHistory(array $current): void {
-        $this->prevStats[] = $current;
-        if (count($this->prevStats) > self::MAX_HISTORY) {
-            array_shift($this->prevStats);
+    private function renderStats(NetworkMonitorData $data): void {
+        $displayed = 0;
+        
+        foreach ($data->stats as $s) {
+            if (!$this->shouldShowInterface($s['name'], $s)) {
+                continue;
+            }
+
+            if ($displayed >= $this->config->max_interfaces) {
+                break;
+            }
+
+            $ips = $data->ips[$s['name']] ?? [];
+            $ipInfo = "";
+            if (!empty($ips)) {
+                $ipInfo = " - " . $this->colorGrey . implode(', ', $ips) . $this->colorReset;
+            }
+            
+            $flags = $this->getInterfaceFlags($s['name']);
+            $flagsDisplay = $this->formatFlags($flags);
+            
+            $details = $this->getInterfaceDetails($s['name']);
+            $detailsInfo = "";
+            if (!empty($details)) {
+                $detailParts = [];
+                if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
+                if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
+                if (isset($details['duplex'])) $detailParts[] = $details['duplex'];
+                $detailsInfo = " (" . implode(', ', $detailParts) . ")";
+            }
+            
+            echo $this->colorBlue . $s['name'] . $this->colorReset . " " . $flagsDisplay . $detailsInfo . $ipInfo . "\n";
+            printf("    RX: %s%s%s (%.0f pkts, %.0f errs, %.0f drop)\n",
+                $this->colorGreen, $this->formatBytes($s['rxBytes']), $this->colorReset,
+                $s['rxPackets'], $s['rxErrs'], $s['rxDrop']);
+            printf("    TX: %s%s%s (%.0f pkts, %.0f errs, %.0f drop)\n\n",
+                $this->colorYellow, $this->formatBytes($s['txBytes']), $this->colorReset,
+                $s['txPackets'], $s['txErrs'], $s['txDrop']);
+            
+            $displayed++;
+        }
+        
+        if ($displayed === 0) {
+            echo $this->colorGrey . "No active interfaces found." . $this->colorReset . "\n";
+        }
+        
+        if ($this->config->show_gateway && $data->gateway) {
+            printf("%sDefault Gateway: %s via %s%s\n",
+                $this->colorCyan, $data->gateway['ip'], $data->gateway['interface'], $this->colorReset);
+        }
+        
+        if (!$this->config->json_output) {
+            echo $this->colorGrey . "Invoke with --watch for live view." . $this->colorReset . "\n";
+        }
+    }
+
+    private function renderDeltas(NetworkMonitorData $data): void {
+        $deltas = $data->deltas;
+        $this->sortDeltas($deltas);
+
+        foreach ($deltas as $name => $delta) {
+            $ips = $data->ips[$name] ?? [];
+            $ipInfo = !empty($ips) ? " [" . implode(', ', $ips) . "]" : "";
+            
+            $flags = $this->getInterfaceFlags($name);
+            $flagsDisplay = $this->formatFlags($flags);
+            
+            $avgRates = $this->getAverageRates($name);
+            $avgInfo = $this->config->show_averages ? 
+                sprintf(" [Avg: %s/%s]", $this->formatRate($avgRates['rx']), $this->formatRate($avgRates['tx'])) : "";
+
+            $details = $this->getInterfaceDetails($name);
+            $detailsInfo = "";
+            if ($this->config->show_details && !empty($details)) {
+                $detailParts = [];
+                if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
+                if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
+                if (isset($details['duplex'])) $detailParts[] = $details['duplex'];
+                if (!empty($detailParts)) {
+                    $detailsInfo = " (" . implode(', ', $detailParts) . ")";
+                }
+            }
+
+            printf("%s%12s%s %s%s%s%s\n",
+                $this->colorBlue, $name, $this->colorReset, $flagsDisplay, $ipInfo, $detailsInfo, $avgInfo);
+            
+            printf("  RX: %s%-12s%s TX: %s%-12s%s\n",
+                $this->colorGreen, $this->formatRate($delta['rxRate']), $this->colorReset,
+                $this->colorYellow, $this->formatRate($delta['txRate']), $this->colorReset);
+            
+            if ($this->config->show_errors && ($delta['rxErrs'] > 0 || $delta['txErrs'] > 0)) {
+                printf("  %sErrors: RX%.0f TX%.0f Drop: RX%.0f TX%.0f%s\n",
+                    $this->colorRed, $delta['rxErrs'], $delta['txErrs'], 
+                    $delta['rxDrop'], $delta['txDrop'], $this->colorReset);
+            }
+            
+            echo "\n";
+        }
+        
+        echo $this->colorGrey . str_repeat("─", 60) . $this->colorReset . "\n";
+        printf("Summary: %d interfaces (%d active) | Total: %s/s RX, %s/s TX\n",
+            $data->metrics['interface_count'], $data->metrics['active_interfaces'],
+            $this->formatRate($data->metrics['total_rx_rate']),
+            $this->formatRate($data->metrics['total_tx_rate']));
+        
+        printf("Peak: %s/s RX, %s/s TX",
+            $this->formatRate($data->metrics['peak_rx_rate']),
+            $this->formatRate($data->metrics['peak_tx_rate']));
+        
+        if ($this->config->show_gateway && $data->gateway) {
+            printf(" | Gateway: %s%s%s",
+                $this->colorCyan, $data->gateway['ip'], $this->colorReset);
+        }
+        
+        printf(" | %s\n", date('H:i:s'));
+        
+        echo $this->colorGrey . "[ctrl+c to stop]" . $this->colorReset . "\n";
+    }
+
+    private function sortDeltas(array &$deltas): void {
+        switch ($this->config->sort_by) {
+            case 'tx_rate':
+                uasort($deltas, function($a, $b) {
+                    return $b['txRate'] <=> $a['txRate'];
+                });
+                break;
+            case 'name':
+                ksort($deltas);
+                break;
+            case 'rx_rate':
+            default:
+                uasort($deltas, function($a, $b) {
+                    return $b['rxRate'] <=> $a['rxRate'];
+                });
+                break;
         }
     }
 
@@ -945,185 +1201,12 @@ class NetworkMonitor {
         return $deltas;
     }
 
-    private function calculateCounterDelta(float $prev, float $curr): float {
-        if ($curr >= $prev) {
-            return $curr - $prev;
-        } else {
-            if (PHP_INT_SIZE === 8 && $prev > PHP_INT_MAX) {
-                return (self::UINT64_MAX - $prev) + $curr + 1;
-            }
-            return (PHP_INT_MAX - $prev) + $curr + 1;
-        }
-    }
-
-    private function updateRateHistory(string $ifaceName, float $rxRate, float $txRate): void {
-        if (!isset($this->rateHistory[$ifaceName])) {
-            $this->rateHistory[$ifaceName] = [
-                'rx' => [],
-                'tx' => []
-            ];
-        }
-
-        $this->rateHistory[$ifaceName]['rx'][] = $rxRate;
-        $this->rateHistory[$ifaceName]['tx'][] = $txRate;
-    }
-
-    private function getAverageRates(string $ifaceName): array {
-        if (!isset($this->rateHistory[$ifaceName])) {
-            return ['rx' => 0, 'tx' => 0];
-        }
-
-        $rxRates = $this->rateHistory[$ifaceName]['rx'];
-        $txRates = $this->rateHistory[$ifaceName]['tx'];
-
-        if (empty($rxRates)) return ['rx' => 0, 'tx' => 0];
-
-        $rxAvg = array_sum($rxRates) / count($rxRates);
-        $txAvg = array_sum($txRates) / count($txRates);
-
-        return ['rx' => $rxAvg, 'tx' => $txAvg];
-    }
-
-    private function calculateAdvancedMetrics(array $deltas): array {
-        $metrics = [
-            'total_rx_rate' => 0,
-            'total_tx_rate' => 0,
-            'peak_rx_rate' => 0,
-            'peak_tx_rate' => 0,
-            'interface_count' => count($deltas),
-            'active_interfaces' => 0
-        ];
-
-        foreach ($deltas as $name => $data) {
-            $metrics['total_rx_rate'] += $data['rxRate'];
-            $metrics['total_tx_rate'] += $data['txRate'];
-            $metrics['peak_rx_rate'] = max($metrics['peak_rx_rate'], $data['rxRate']);
-            $metrics['peak_tx_rate'] = max($metrics['peak_tx_rate'], $data['txRate']);
-            
-            if ($data['rxRate'] > 0 || $data['txRate'] > 0) {
-                $metrics['active_interfaces']++;
-            }
-            
-            $this->updateRateHistory($name, $data['rxRate'], $data['txRate']);
-        }
-
-        return $metrics;
-    }
-
-    private function detectNetworkIssues(array $deltas): array {
-        $issues = [];
-        
-        foreach ($deltas as $name => $data) {
-            $totalPackets = $data['rxPackets'] + $data['txPackets'];
-            $totalErrors = $data['rxErrs'] + $data['txErrs'];
-            
-            if ($totalPackets > 1000) {
-                $errorRate = $totalErrors / $totalPackets;
-                if ($errorRate > $this->config->alert_threshold) {
-                    $issues[] = sprintf("High error rate on %s: %.2f%%", $name, $errorRate * 100);
-                }
-            }
-            
-            $state = $this->getInterfaceStateCached($name);
-            if ($state !== 'up' && ($data['rxBytes'] > 0 || $data['txBytes'] > 0)) {
-                $issues[] = "Interface $name is down but previously had traffic";
-            }
-        }
-        
-        return $issues;
-    }
-
-    private function sortDeltas(array &$deltas): void {
-        switch ($this->config->sort_by) {
-            case 'tx_rate':
-                uasort($deltas, function($a, $b) {
-                    return $b['txRate'] <=> $a['txRate'];
-                });
-                break;
-            case 'name':
-                ksort($deltas);
-                break;
-            case 'rx_rate':
-            default:
-                uasort($deltas, function($a, $b) {
-                    return $b['rxRate'] <=> $a['rxRate'];
-                });
-                break;
-        }
-    }
-
-    private function displayEnhancedDeltas(array $deltas): void {
-        $this->currentData = $deltas;
-        $ipMap = $this->getInterfaceIPs();
-        $metrics = $this->calculateAdvancedMetrics($deltas);
-        $gateway = $this->getDefaultGateway();
-        
-        $this->sortDeltas($deltas);
-
-        foreach ($deltas as $name => $data) {
-            $ips = $ipMap[$name] ?? [];
-            $ipInfo = !empty($ips) ? " [" . implode(', ', $ips) . "]" : "";
-            
-            $flags = $this->getInterfaceFlags($name);
-            $flagsDisplay = $this->formatFlags($flags);
-            
-            $avgRates = $this->getAverageRates($name);
-            $avgInfo = $this->config->show_averages ? 
-                sprintf(" [Avg: %s/%s]", $this->formatRate($avgRates['rx']), $this->formatRate($avgRates['tx'])) : "";
-
-            $details = $this->getInterfaceDetails($name);
-            $detailsInfo = "";
-            if ($this->config->show_details && !empty($details)) {
-                $detailParts = [];
-                if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
-                if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
-                if (isset($details['duplex'])) $detailParts[] = $details['duplex'];
-                if (!empty($detailParts)) {
-                    $detailsInfo = " (" . implode(', ', $detailParts) . ")";
-                }
-            }
-
-            printf("%s%12s%s %s%s%s%s\n",
-                $this->colorBlue, $name, $this->colorReset, $flagsDisplay, $ipInfo, $detailsInfo, $avgInfo);
-            
-            printf("  RX: %s%-12s%s TX: %s%-12s%s\n",
-                $this->colorGreen, $this->formatRate($data['rxRate']), $this->colorReset,
-                $this->colorYellow, $this->formatRate($data['txRate']), $this->colorReset);
-            
-            if ($this->config->show_errors && ($data['rxErrs'] > 0 || $data['txErrs'] > 0)) {
-                printf("  %sErrors: RX%.0f TX%.0f Drop: RX%.0f TX%.0f%s\n",
-                    $this->colorRed, $data['rxErrs'], $data['txErrs'], 
-                    $data['rxDrop'], $data['txDrop'], $this->colorReset);
-            }
-            
-            echo "\n";
-        }
-        
-        $this->displaySummary($metrics, count($deltas), $gateway);
-    }
-
-    private function displaySummary(array $metrics, int $interfaceCount, ?array $gateway): void {
-        echo $this->colorGrey . str_repeat("─", 60) . $this->colorReset . "\n";
-        printf("Summary: %d interfaces (%d active) | Total: %s/s RX, %s/s TX\n",
-            $interfaceCount, $metrics['active_interfaces'],
-            $this->formatRate($metrics['total_rx_rate']),
-            $this->formatRate($metrics['total_tx_rate']));
-        
-        printf("Peak: %s/s RX, %s/s TX",
-            $this->formatRate($metrics['peak_rx_rate']),
-            $this->formatRate($metrics['peak_tx_rate']));
-        
-        if ($this->config->show_gateway && $gateway) {
-            printf(" | Gateway: %s%s%s",
-                $this->colorCyan, $gateway['ip'], $this->colorReset);
-        }
-        
-        printf(" | %s\n", date('H:i:s'));
-        
-        echo $this->colorGrey . "[ctrl+c to stop]" . $this->colorReset . "\n";
-    }
-
     private function adaptiveSleepWithProgress(float $interval): void {
+        if ($this->config->json_output) {
+            usleep((int)($interval * 1000000));
+            return;
+        }
+        
         $sleepSteps = self::PROGRESS_STEPS;
         $stepDuration = max(self::MIN_SLEEP_STEP_US, ($interval * 1000000) / $sleepSteps);
         
@@ -1140,92 +1223,91 @@ class NetworkMonitor {
         echo "\r" . str_repeat(' ', 50) . "\r";
     }
 
-    private function collectData(float $interval): array {
-        $gateway = $this->getDefaultGateway();
-        $stats = $this->getCachedStats();
-        
-        if (empty($this->prevStats)) {
-            $this->prevStats[] = $stats;
-            return ['gateway' => $gateway, 'stats' => $stats, 'deltas' => []];
-        }
-        
-        $prev = end($this->prevStats);
-        $deltas = $this->calculateDelta($prev, $stats, $interval);
-        
-        return [
-            'gateway' => $gateway,
-            'stats' => $stats,
-            'deltas' => $deltas,
-            'issues' => $this->detectNetworkIssues($deltas),
-            'metrics' => $this->calculateAdvancedMetrics($deltas),
-            'ips' => $this->getInterfaceIPs()
-        ];
+    private function signalHandler(int $signo): void {
+        $this->log("Received signal $signo, shutting down");
+        $this->shouldExit = true;
     }
 
-    public function watch(float $interval): void {
-        $this->log("Starting watch mode with interval: {$interval}s");
+    private function setupSignalHandlers(): void {
+        if (!extension_loaded('pcntl')) {
+            $this->log('PCNTL extension not available, signal handling disabled');
+            return;
+        }
+        
+        if (function_exists('pcntl_async_signals')) {
+            pcntl_async_signals(true);
+        }
+        
+        $handler = function($signo) {
+            $this->signalHandler($signo);
+        };
+        
+        $signals = [
+            defined('SIGINT') ? SIGINT : 2,
+            defined('SIGTERM') ? SIGTERM : 15,
+            defined('SIGHUP') ? SIGHUP : 1
+        ];
+        
+        foreach ($signals as $signal) {
+            if (!pcntl_signal($signal, $handler)) {
+                $this->log("Failed to set handler for signal $signal");
+            }
+        }
+    }
+
+    private function watchMode(): void {
+        $this->log("Starting watch mode with interval: {$this->config->interval}s");
         
         $this->setupSignalHandlers();
-        $iteration = 0;
-        $startTime = time();
+        $this->iterationStart = time();
+        $this->iteration = 0;
 
         try {
-            $prev = $this->parseProcNetDev();
-            $this->prevStats[] = $prev;
+            $firstStats = $this->parseProcNetDev();
+            $this->prevStats[] = $firstStats;
         } catch (Exception $e) {
             throw new RuntimeException("Failed to initialize monitoring: " . $e->getMessage());
         }
 
         while (!$this->shouldExit) {
-            $iteration++;
-            $currentTime = time();
-            $uptime = $currentTime - $startTime;
+            $this->iteration++;
             
             $this->checkResourceUsage();
             
-            if (!isset($options['json'])) {
-                $this->header($this->getDefaultGateway());
-                printf("Uptime: %ds | Iteration: %d | %s\n\n", 
-                       $uptime, $iteration, date('Y-m-d H:i:s'));
-            }
-
             try {
                 $this->cleanupCaches();
-                $data = $this->collectData($interval);
+                $data = $this->collectData(true);
+                $this->renderData($data);
+                $this->prevStats[] = $data->stats;
                 
-                if (isset($options['json'])) {
-                    $this->outputJson($data);
-                } else {
-                    if (!empty($data['issues'])) {
-                        echo $this->colorRed . "Network Issues:\n";
-                        foreach ($data['issues'] as $issue) {
-                            echo "  ALERT: $issue\n";
-                        }
-                        echo $this->colorReset . "\n";
-                    }
-                    
-                    $this->displayEnhancedDeltas($data['deltas']);
+                if (count($this->prevStats) > self::MAX_HISTORY) {
+                    array_shift($this->prevStats);
                 }
-                
-                $this->manageHistory($data['stats']);
             } catch (Exception $e) {
                 $this->log("Monitoring error: " . $e->getMessage());
-                if (!isset($options['json'])) {
+                if (!$this->config->json_output) {
                     echo $this->colorRed . "Read error: " . $this->getUserFriendlyMessage($e->getMessage()) . $this->colorReset . "\n";
                 }
             }
 
             if ($this->shouldExit) break;
 
-            if (!isset($options['json'])) {
-                $this->adaptiveSleepWithProgress($interval);
-            } else {
-                usleep((int)($interval * 1000000));
-            }
+            $this->adaptiveSleepWithProgress($this->config->interval);
         }
 
-        if (!isset($options['json'])) {
-            echo "\n" . $this->colorGrey . "Exiting after $iteration iterations..." . $this->colorReset . "\n";
+        if (!$this->config->json_output) {
+            echo "\n" . $this->colorGrey . "Exiting after $this->iteration iterations..." . $this->colorReset . "\n";
+        }
+    }
+
+    private function singleShotMode(): void {
+        $this->log("Running in single shot mode");
+        
+        try {
+            $data = $this->collectData(false);
+            $this->renderData($data);
+        } catch (Exception $e) {
+            throw new RuntimeException("Failed to read network statistics: " . $e->getMessage());
         }
     }
 
@@ -1243,84 +1325,6 @@ class NetworkMonitor {
         }
         
         return $message;
-    }
-
-    private function outputJson(array $data): void {
-        $output = [
-            'timestamp' => time(),
-            'gateway' => $data['gateway'],
-            'interfaces' => $data['deltas'],
-            'issues' => $data['issues'] ?? [],
-            'metrics' => $data['metrics'] ?? [],
-            'ip_addresses' => $data['ips'] ?? []
-        ];
-        
-        echo json_encode($output) . "\n";
-    }
-
-    private function singleShotMode(): void {
-        $this->log("Running in single shot mode");
-        
-        $data = $this->collectData($this->config->interval);
-        
-        if (isset($options['json'])) {
-            $this->outputJson($data);
-            return;
-        }
-        
-        $this->header($data['gateway']);
-        
-        $displayed = 0;
-        
-        foreach ($data['stats'] as $s) {
-            if (!$this->shouldShowInterface($s['name'], $s)) {
-                continue;
-            }
-
-            if ($displayed >= $this->config->max_interfaces) {
-                break;
-            }
-
-            $ips = $data['ips'][$s['name']] ?? [];
-            $ipInfo = "";
-            if (!empty($ips)) {
-                $ipInfo = " - " . $this->colorGrey . implode(', ', $ips) . $this->colorReset;
-            }
-            
-            $flags = $this->getInterfaceFlags($s['name']);
-            $flagsDisplay = $this->formatFlags($flags);
-            
-            $details = $this->getInterfaceDetails($s['name']);
-            $detailsInfo = "";
-            if (!empty($details)) {
-                $detailParts = [];
-                if (isset($details['speed'])) $detailParts[] = $details['speed'] . ' Mbps';
-                if (isset($details['mtu'])) $detailParts[] = 'MTU:' . $details['mtu'];
-                if (isset($details['duplex'])) $detailParts[] = $details['duplex'];
-                $detailsInfo = " (" . implode(', ', $detailParts) . ")";
-            }
-            
-            echo $this->colorBlue . $s['name'] . $this->colorReset . " " . $flagsDisplay . $detailsInfo . $ipInfo . "\n";
-            printf("    RX: %s%s%s (%.0f pkts, %.0f errs, %.0f drop)\n",
-                $this->colorGreen, $this->formatBytes($s['rxBytes']), $this->colorReset,
-                $s['rxPackets'], $s['rxErrs'], $s['rxDrop']);
-            printf("    TX: %s%s%s (%.0f pkts, %.0f errs, %.0f drop)\n\n",
-                $this->colorYellow, $this->formatBytes($s['txBytes']), $this->colorReset,
-                $s['txPackets'], $s['txErrs'], $s['txDrop']);
-            
-            $displayed++;
-        }
-        
-        if ($displayed === 0) {
-            echo $this->colorGrey . "No active interfaces found." . $this->colorReset . "\n";
-        }
-        
-        if ($this->config->show_gateway && $data['gateway']) {
-            printf("%sDefault Gateway: %s via %s%s\n",
-                $this->colorCyan, $data['gateway']['ip'], $data['gateway']['interface'], $this->colorReset);
-        }
-        
-        echo $this->colorGrey . "Invoke with --watch for live view." . $this->colorReset . "\n";
     }
 
     private function handleOptions(array $options): void {
@@ -1358,6 +1362,10 @@ class NetworkMonitor {
             $configUpdates['show_gateway'] = true;
         }
 
+        if (isset($options['json'])) {
+            $configUpdates['json_output'] = true;
+        }
+
         if (!empty($configUpdates)) {
             $this->config = new NetworkMonitorConfig(array_merge(get_object_vars($this->config), $configUpdates));
             $this->validateConfig();
@@ -1366,13 +1374,12 @@ class NetworkMonitor {
 
     public function run(): void {
         try {
-            global $options;
             $options = getopt('', ['watch', 'interval:', 'debug', 'no-loopback', 'show-inactive', 'units:', 'sort-by:', 'show-details', 'show-gateway', 'json']);
             
             $this->handleOptions($options);
 
             if (isset($options['watch'])) {
-                $this->watch($this->config->interval);
+                $this->watchMode();
             } else {
                 $this->singleShotMode();
             }
@@ -1398,7 +1405,7 @@ class NetworkMonitor {
         $this->interfaceDetailsCache = [];
         $this->stateCache = [];
         
-        if ($this->useColors) {
+        if (!$this->config->json_output && $this->useColors) {
             echo "\033[0m\033[?25h";
         }
         
